@@ -691,6 +691,7 @@ export function buildApp(
     grants: artifactMap<KeychainGrant>("keychain_grants"),
     asks: artifactMap<KeychainAsk>("keychain_asks"),
     key: credentialKey,
+    advisoryLock,
     refreshConnector: makeRefresh({ resolveClient }),
   });
   const keychain: Keychain | undefined = keychainKeyMaterial ? credentialStore : undefined;
@@ -1185,6 +1186,22 @@ export function buildApp(
     modelProviders: modelProviderAvailabilityFor(config.harness, providerKeys),
     runWaitMs: config.runWaitMs,
   });
+  const askResolution = keychain
+    ? (ask: KeychainAsk, grant?: KeychainGrant) =>
+        fireAskResolution(
+          {
+            deliveries,
+            idempotency,
+            identity,
+            run: (req) => app.turn(req),
+            directory,
+            getAsk: (id) => keychain.getAsk(id),
+            getGrant: (id) => keychain.getGrant(id),
+          },
+          ask,
+          grant,
+        )
+    : undefined;
   const slackCore = createSlackCoreClient({
     app,
     config: configStore,
@@ -1195,6 +1212,9 @@ export function buildApp(
     runs,
     turnStream,
     tasks,
+    keychain,
+    auditLog,
+    ...(askResolution ? { fireAskResolution: askResolution } : {}),
     ackPicks: ackEmojiPicks,
     ackModelId: () => auxiliaryModelForProvider("anthropic"),
     ...(config.brandingDefault ? { brandingDefault: config.brandingDefault } : {}),
@@ -1274,22 +1294,6 @@ export function buildApp(
   );
   orchestratorDeps.channelPolicy = channelPolicy;
   orchestratorDeps.surfaceCache = surfaceCache;
-  const askResolution = keychain
-    ? (ask: KeychainAsk, grant?: KeychainGrant) =>
-        fireAskResolution(
-          {
-            deliveries,
-            idempotency,
-            identity,
-            run: (req) => app.turn(req),
-            directory,
-            getAsk: (id) => keychain.getAsk(id),
-            getGrant: (id) => keychain.getGrant(id),
-          },
-          ask,
-          grant,
-        )
-    : undefined;
   const dropResolution = keychain
     ? (drop: DropResolution) =>
         fireDropResolution({ deliveries, idempotency, identity, run: (req) => app.turn(req), directory }, drop)
