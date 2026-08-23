@@ -207,4 +207,8 @@ test("managed integrations choose an app before opening Pipedream Connect", () =
   assert.match(connectorsSource, /aria-label=\$\{`\$\{managedIntegrationConnecting/);
   assert.match(connectorsSource, /managedIntegrationSearchError/);
   assert.match(shellCssSource, /\.kc-app-result > div[\s\S]*overflow-wrap: anywhere/);
+  assert.match(connectorsSource, /Connect the HighLevel sub-account for this business/);
+  assert.match(connectorsSource, /not an agency-level account spanning multiple clients/);
+  assert.match(connectorsSource, /Provider authorization may include broad read and write access/);
+  assert.match(connectorsSource, /await startManagedIntegration\(appSlug, true\)/);
 });

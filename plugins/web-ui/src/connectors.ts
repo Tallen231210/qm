@@ -1116,7 +1116,29 @@ async function searchManagedIntegrationApps(query: string): Promise<void> {
   }
 }
 
-async function startManagedIntegration(appSlug: string): Promise<void> {
+async function startManagedIntegration(appSlug: string, confirmed = false): Promise<void> {
+  if (!confirmed) {
+    const appName =
+      managedIntegrationApps.find((app) => app.nameSlug === appSlug)?.name ??
+      managedIntegrations.find((connection) => connection.appSlug === appSlug)?.appName ??
+      appSlug;
+    confirmationOpener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    confirmation = {
+      title: `Connect ${appName}?`,
+      body:
+        appSlug === "highlevel_oauth"
+          ? "Connect the HighLevel sub-account for this business, not an agency-level account spanning multiple clients. Pipedream's standard HighLevel authorization includes broad read and write access. Continue only if the provider screen shows the intended business."
+          : "Connect only the account for this business. If the provider offers a parent, agency, or multi-client account, select the leaf account or sub-account for this workspace. Provider authorization may include broad read and write access; verify the exact business on the provider screen.",
+      action: "Continue to provider",
+      run: async () => {
+        confirmation = null;
+        confirmationOpener = null;
+        await startManagedIntegration(appSlug, true);
+      },
+    };
+    drawConnectors();
+    return;
+  }
   const operation = keychainOperations.beginNavigation();
   if (!operation) return;
   connectorNotice = "";

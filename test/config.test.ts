@@ -425,6 +425,7 @@ test("Pipedream Connect configuration is all-or-nothing", () => {
       PIPEDREAM_MCP_URL: "https://mcp.example.test/v3",
     }).pipedream,
     {
+      mode: "direct",
       clientId: "client",
       clientSecret: "secret",
       projectId: "proj_test",
@@ -432,6 +433,32 @@ test("Pipedream Connect configuration is all-or-nothing", () => {
       apiUrl: "https://api.example.test",
       mcpUrl: "https://mcp.example.test/v3",
     },
+  );
+  assert.deepEqual(
+    loadConfig({
+      PIPEDREAM_BROKER_URL: "https://broker.example.test/integrations/",
+      PIPEDREAM_BROKER_TOKEN: "tenant-token",
+    }).pipedream,
+    {
+      mode: "broker",
+      brokerUrl: "https://broker.example.test/integrations",
+      brokerToken: "tenant-token",
+    },
+  );
+  assert.throws(
+    () => loadConfig({ PIPEDREAM_BROKER_URL: "https://broker.example.test/integrations" }),
+    /PIPEDREAM_BROKER_URL and PIPEDREAM_BROKER_TOKEN must be set together/,
+  );
+  assert.throws(
+    () =>
+      loadConfig({
+        PIPEDREAM_CLIENT_ID: "client",
+        PIPEDREAM_CLIENT_SECRET: "secret",
+        PIPEDREAM_PROJECT_ID: "proj_test",
+        PIPEDREAM_BROKER_URL: "https://broker.example.test/integrations",
+        PIPEDREAM_BROKER_TOKEN: "tenant-token",
+      }),
+    /directly or through a broker/,
   );
 });
 

@@ -3,10 +3,11 @@ import type { AuditLog } from "../audit/audit-log.ts";
 import type { McpServer } from "../mcp/mcp-server-store.ts";
 import type { McpToolDescriptor, McpToolService } from "../mcp/mcp-tool-service.ts";
 import { personalScope, type ScopeId } from "../types.ts";
+import { createKeyedQueue } from "../util/async.ts";
 import type { IntegrationConnection, IntegrationConnectionStore } from "./integration-store.ts";
 import {
   normalizePipedreamAppSlug,
-  PipedreamClient,
+  type PipedreamConnectClient,
   type PipedreamAccount,
   type PipedreamApp,
   type PipedreamTool,
@@ -65,7 +66,7 @@ function connectionFromAccount(
     ownerId: principalId,
     appSlug: account.app.name_slug,
     appName: account.app.name,
-    accountName: account.name,
+    accountName: account.name?.trim() || account.app.name,
     ...(account.app.img_src ? { imageUrl: account.app.img_src } : {}),
     healthy: account.healthy && !account.dead,
     scopes: existing?.ownerId === principalId ? existing.scopes : [personalScope(principalId)],
@@ -91,6 +92,65 @@ function canonicalValue(value: unknown): unknown {
   );
 }
 
+const SENSITIVE_FIELD =
+  /(token|secret|password|authorization|api.?key|credential|cookie|signature|(^|_)sig$|(^|_)key$|^sk_)/i;
+
+const SENSITIVE_VALUE = /(?:Bearer|Basic)\s+\S+|(?:sk|pk)[-_](?:live|test)?[_-]?[A-Za-z0-9_-]{8,}/i;
+
+function redactSecretValues(value: string): string {
+  return value.replace(/(?:Bearer|Basic)\s+\S+|(?:sk|pk)[-_](?:live|test)?[_-]?[A-Za-z0-9_-]{8,}/gi, "[redacted]");
+}
+
+function approvalString(value: string): string {
+  try {
+    const url = new URL(value);
+    if (!["http:", "https:"].includes(url.protocol)) return redactSecretValues(value);
+    if (url.username || url.password) {
+      url.username = "redacted";
+      url.password = "redacted";
+    }
+    url.pathname = redactSecretValues(url.pathname);
+    const query = new URLSearchParams();
+    for (const [key, entry] of url.searchParams) {
+      query.append(key, SENSITIVE_FIELD.test(key) ? "[redacted]" : redactSecretValues(entry));
+    }
+    url.search = query.toString();
+    if (url.hash) {
+      const rawFragment = url.hash.slice(1);
+      if (rawFragment.includes("=")) {
+        const fragment = new URLSearchParams(rawFragment);
+        const safeFragment = new URLSearchParams();
+        for (const [key, entry] of fragment) {
+          safeFragment.append(key, SENSITIVE_FIELD.test(key) ? "[redacted]" : redactSecretValues(entry));
+        }
+        url.hash = safeFragment.toString();
+      } else if (SENSITIVE_VALUE.test(rawFragment)) {
+        url.hash = redactSecretValues(rawFragment);
+      }
+    }
+    return url.toString();
+  } catch {
+    return redactSecretValues(value);
+  }
+}
+
+function approvalValue(value: unknown, key = ""): unknown {
+  if (SENSITIVE_FIELD.test(key)) return "[redacted]";
+  if (Array.isArray(value)) return value.map((entry) => approvalValue(entry));
+  if (value && typeof value === "object") {
+    const named = value as Record<string, unknown>;
+    const discriminator = typeof named.name === "string" ? named.name : typeof named.key === "string" ? named.key : "";
+    const namedSecret = SENSITIVE_FIELD.test(discriminator);
+    return Object.fromEntries(
+      Object.entries(named).map(([childKey, entry]) => [
+        SENSITIVE_FIELD.test(childKey) ? "[redacted]" : childKey,
+        childKey === "value" && namedSecret ? "[redacted]" : approvalValue(entry, childKey),
+      ]),
+    );
+  }
+  return typeof value === "string" ? approvalString(value) : value;
+}
+
 function toolArguments(args: Record<string, unknown>): Record<string, unknown> {
   return args.arguments && typeof args.arguments === "object" ? (args.arguments as Record<string, unknown>) : {};
 }
@@ -113,8 +173,14 @@ function approvalDetails(
   const app = safeLabel(connection.appSlug);
   const toolName = safeLabel(tool.name);
   const account = safeLabel(connection.accountId);
+  const accountName = safeLabel(connection.accountName);
   const fieldCount = Object.keys(toolArgs).length;
-  const operation = `${app}/${toolName} on account ${account} with ${fieldCount} argument field${fieldCount === 1 ? "" : "s"}`;
+  const canonicalArgs = canonicalValue(toolArgs);
+  if (Buffer.byteLength(JSON.stringify(canonicalArgs)) > 1200) {
+    throw new Error("Integration arguments are too large to disclose safely for approval");
+  }
+  const safeArgs = JSON.stringify(approvalValue(canonicalArgs));
+  const operation = `${app}/${toolName} on ${accountName} (${account}) with ${fieldCount} argument field${fieldCount === 1 ? "" : "s"}: ${safeArgs}`;
   return {
     reason: `External integration operation requires approval: ${operation}`,
     approvalKey: `integration:${account}:${toolName}:${digest}`,
@@ -123,7 +189,7 @@ function approvalDetails(
 }
 
 export function createPipedreamIntegrationService(opts: {
-  client?: PipedreamClient;
+  client?: PipedreamConnectClient;
   store: IntegrationConnectionStore;
   audit?: AuditLog;
   approvalSecret?: string;
@@ -132,6 +198,7 @@ export function createPipedreamIntegrationService(opts: {
   if (opts.client && !opts.approvalSecret) throw new Error("Pipedream integrations require an approval binding secret");
   const now = opts.now ?? (() => Date.now());
   const toolCache = new Map<string, { at: number; tools: PipedreamTool[] }>();
+  const syncQueue = createKeyedQueue<string>();
 
   const record = (
     principalId: string,
@@ -152,35 +219,45 @@ export function createPipedreamIntegrationService(opts: {
     });
 
   async function syncOwned(principalId: string): Promise<IntegrationConnection[]> {
-    if (!opts.client) return [];
-    const accounts = await opts.client.listAccounts(principalId);
-    const externalUserId = opts.client.externalUserId(principalId);
-    const synced: IntegrationConnection[] = [];
-    for (const account of accounts) {
-      const incoming = connectionFromAccount(account, principalId, externalUserId, null, now());
-      await opts.store.putIfAbsent(incoming);
-      const connection =
-        (await opts.store.update(account.id, (current) => ({
-          ...incoming,
-          scopes: current.ownerId === principalId ? current.scopes : incoming.scopes,
-          access: current.ownerId === principalId ? current.access : incoming.access,
-          createdAt: current.ownerId === principalId ? current.createdAt : incoming.createdAt,
-        }))) ?? incoming;
-      synced.push(connection);
-    }
-    const activeIds = new Set(synced.map((connection) => connection.accountId));
-    for (const connection of await opts.store.list()) {
-      if (connection.ownerId === principalId && !activeIds.has(connection.accountId)) {
-        await opts.store.delete(connection.accountId);
-        toolCache.delete(connection.accountId);
+    return syncQueue(principalId, async () => {
+      if (!opts.client) return [];
+      const accounts = await opts.client.listAccounts(principalId);
+      const externalUserId = opts.client.externalUserId(principalId);
+      const synced: IntegrationConnection[] = [];
+      for (const account of accounts) {
+        const incoming = connectionFromAccount(account, principalId, externalUserId, null, now());
+        await opts.store.putIfAbsent(incoming);
+        const connection =
+          (await opts.store.update(account.id, (current) => ({
+            ...(current.disconnectedAt ? current : incoming),
+            scopes: current.ownerId === principalId ? current.scopes : incoming.scopes,
+            access: current.ownerId === principalId ? current.access : incoming.access,
+            createdAt: current.ownerId === principalId ? current.createdAt : incoming.createdAt,
+          }))) ?? incoming;
+        if (connection.disconnectedAt) {
+          if (connection.ownerId === principalId) {
+            try {
+              await opts.client.deleteAccount(principalId, connection.accountId);
+              toolCache.delete(connection.accountId);
+            } catch {
+              record(principalId, "disconnect.retry", connection.accountId, undefined, "failed", {
+                app: connection.appSlug,
+              });
+            }
+          }
+          continue;
+        }
+        synced.push(connection);
       }
-    }
-    return synced.sort((a, b) => a.appName.localeCompare(b.appName) || a.accountName.localeCompare(b.accountName));
+      return synced.sort((a, b) => a.appName.localeCompare(b.appName) || a.accountName.localeCompare(b.accountName));
+    });
   }
 
   async function available(principalId: string, scopeId?: string): Promise<IntegrationConnection[]> {
     const scope = scopeId ?? personalScope(principalId);
-    return (await opts.store.list()).filter((connection) => connection.scopes.includes(scope));
+    return (await opts.store.list()).filter(
+      (connection) => !connection.disconnectedAt && connection.scopes.includes(scope),
+    );
   }
 
   async function selectConnection(
@@ -251,7 +328,7 @@ export function createPipedreamIntegrationService(opts: {
       let priorAccess: IntegrationConnection["access"] | undefined;
       let priorScopes: ScopeId[] | undefined;
       const updated = await opts.store.update(accountId, (current) => {
-        if (current.ownerId !== principalId) return current;
+        if (current.ownerId !== principalId || current.disconnectedAt) return current;
         priorAccess = current.access;
         priorScopes = current.scopes;
         return {
@@ -281,9 +358,21 @@ export function createPipedreamIntegrationService(opts: {
         return false;
       }
       try {
-        await opts.client.deleteAccount(accountId);
-        await opts.store.delete(accountId);
+        const disconnected = await opts.store.update(accountId, (connection) =>
+          connection.ownerId === principalId
+            ? {
+                ...connection,
+                healthy: false,
+                scopes: [],
+                access: "read",
+                disconnectedAt: connection.disconnectedAt ?? now(),
+                updatedAt: now(),
+              }
+            : connection,
+        );
+        if (!disconnected?.disconnectedAt || disconnected.ownerId !== principalId) return false;
         toolCache.delete(accountId);
+        await opts.client.deleteAccount(principalId, accountId);
         record(principalId, "disconnect", accountId, undefined, "ok", { app: current.appSlug });
         return true;
       } catch (error) {
@@ -319,7 +408,7 @@ export function createPipedreamIntegrationService(opts: {
         });
         throw new Error(`Unknown ${connection.appName} tool: ${toolName || "(missing)"}`);
       }
-      if (connection.access !== "read-write") {
+      if (connection.access !== "read-write" && !tool.readOnly) {
         record(principalId, "tool.authorize", connection.accountId, scopeId, "refused", {
           app: connection.appSlug,
           tool: tool.name,
@@ -355,11 +444,12 @@ export function createPipedreamIntegrationService(opts: {
       if (args.action === "list_tools") {
         try {
           return JSON.stringify(
-            (await toolsFor(connection)).map(({ name: tool, description, inputSchema }) => ({
+            (await toolsFor(connection)).map(({ name: tool, description, inputSchema, readOnly }) => ({
               tool,
               description,
               input_schema: inputSchema,
               approval_required: true,
+              read_only: readOnly,
             })),
           );
         } catch (error) {
@@ -389,7 +479,7 @@ export function createPipedreamIntegrationService(opts: {
         });
         throw new Error(`Unknown ${connection.appName} tool: ${toolName}`);
       }
-      if (connection.access !== "read-write") {
+      if (connection.access !== "read-write" && !tool.readOnly) {
         record(principalId, "tool.call", connection.accountId, scopeId, "refused", {
           app: connection.appSlug,
           tool: toolName,

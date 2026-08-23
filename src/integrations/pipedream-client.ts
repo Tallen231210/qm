@@ -7,8 +7,9 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const APP_SLUG_PATTERN = /^[a-z0-9][a-z0-9_-]{0,127}$/i;
 const DEFAULT_CONNECT_ORIGIN = "https://pipedream.com";
 const CONNECT_PATH = "/_static/connect.html";
+const OAUTH_SCOPE = "connect:accounts:read connect:accounts:write connect:tokens:create connect:actions:*";
 
-export type PipedreamEnvironment = "development" | "production";
+type PipedreamEnvironment = "development" | "production";
 
 export interface PipedreamConfig {
   clientId: string;
@@ -23,7 +24,8 @@ export interface PipedreamConfig {
 
 export interface PipedreamAccount {
   id: string;
-  name: string;
+  name: string | null;
+  external_id?: string;
   healthy: boolean;
   dead: boolean;
   app: {
@@ -46,6 +48,30 @@ export interface PipedreamTool {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
+  readOnly: boolean;
+}
+
+export interface PipedreamConnectClient {
+  externalUserId(principalId: string): string;
+  listApps(query: string): Promise<PipedreamApp[]>;
+  createConnectLink(
+    principalId: string,
+    appSlug: string,
+    redirectUri?: string,
+  ): Promise<{ url: string; expiresAt: string }>;
+  listAccounts(principalId: string): Promise<PipedreamAccount[]>;
+  deleteAccount(principalId: string, accountId: string): Promise<void>;
+  listTools(connection: {
+    externalUserId: string;
+    ownerId: string;
+    accountId: string;
+    appSlug: string;
+  }): Promise<PipedreamTool[]>;
+  callTool(
+    connection: { externalUserId: string; ownerId: string; accountId: string; appSlug: string },
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<string>;
 }
 
 interface AccessToken {
@@ -55,6 +81,14 @@ interface AccessToken {
 
 function jsonObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+}
+
+function serviceUrl(value: string, name: string): string {
+  const url = new URL(value);
+  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) {
+    throw new Error(`${name} must be an HTTPS URL without credentials, query, or fragment`);
+  }
+  return url.toString().replace(/\/$/, "");
 }
 
 export function normalizePipedreamAppSlug(value: unknown): string | null {
@@ -114,7 +148,7 @@ async function boundedJson(response: Response): Promise<Record<string, unknown>>
   return jsonObject(JSON.parse(text));
 }
 
-export class PipedreamClient {
+export class PipedreamClient implements PipedreamConnectClient {
   private token: AccessToken | null = null;
   private rpcId = 0;
   private readonly config: PipedreamConfig;
@@ -128,8 +162,8 @@ export class PipedreamClient {
     this.config = config;
     this.fetchImpl = fetchImpl;
     this.now = now;
-    this.apiUrl = (config.apiUrl ?? "https://api.pipedream.com").replace(/\/$/, "");
-    this.mcpUrl = config.mcpUrl ?? "https://remote.mcp.pipedream.net/v3";
+    this.apiUrl = serviceUrl(config.apiUrl ?? "https://api.pipedream.com", "PIPEDREAM_API_URL");
+    this.mcpUrl = serviceUrl(config.mcpUrl ?? "https://remote.mcp.pipedream.net/v3", "PIPEDREAM_MCP_URL");
     this.connectOrigin = new URL(config.connectOrigin ?? DEFAULT_CONNECT_ORIGIN).origin;
   }
 
@@ -150,6 +184,7 @@ export class PipedreamClient {
         grant_type: "client_credentials",
         client_id: this.config.clientId,
         client_secret: this.config.clientSecret,
+        scope: OAUTH_SCOPE,
       }),
     });
     if (!response.ok) throw new Error(`Pipedream authentication failed (HTTP ${response.status})`);
@@ -241,21 +276,52 @@ export class PipedreamClient {
   }
 
   async listAccounts(principalId: string): Promise<PipedreamAccount[]> {
-    const query = new URLSearchParams({
-      external_user_id: this.externalUserId(principalId),
-      include_credentials: "false",
-      limit: "100",
-    });
-    const response = await this.request(
-      `${this.apiUrl}/v1/connect/${encodeURIComponent(this.config.projectId)}/accounts?${query}`,
-      { headers: await this.headers() },
-    );
-    if (!response.ok) throw new Error(`Pipedream account list failed (HTTP ${response.status})`);
-    const body = await boundedJson(response);
-    return Array.isArray(body.data) ? (body.data as PipedreamAccount[]) : [];
+    const accounts: PipedreamAccount[] = [];
+    const cursors = new Set<string>();
+    let received = 0;
+    let after = "";
+    do {
+      const query = new URLSearchParams({
+        external_user_id: this.externalUserId(principalId),
+        include_credentials: "false",
+        limit: "100",
+        ...(after ? { after } : {}),
+      });
+      const response = await this.request(
+        `${this.apiUrl}/v1/connect/${encodeURIComponent(this.config.projectId)}/accounts?${query}`,
+        { headers: await this.headers() },
+      );
+      if (!response.ok) throw new Error(`Pipedream account list failed (HTTP ${response.status})`);
+      const body = await boundedJson(response);
+      const data = Array.isArray(body.data) ? (body.data as PipedreamAccount[]) : [];
+      accounts.push(...data);
+      const page = jsonObject(body.page_info);
+      const count = Number.isSafeInteger(page.count) && Number(page.count) >= 0 ? Number(page.count) : data.length;
+      const total =
+        Number.isSafeInteger(page.total_count) && Number(page.total_count) >= 0 ? Number(page.total_count) : null;
+      received += count;
+      const hasMore = total !== null && received < total;
+      const next = hasMore && typeof page.end_cursor === "string" ? page.end_cursor : "";
+      if ((hasMore && !next) || (next && (cursors.has(next) || received > 10_000))) {
+        throw new Error("Pipedream account pagination was invalid");
+      }
+      if (next) cursors.add(next);
+      after = next;
+    } while (after);
+    return accounts;
   }
 
-  async deleteAccount(accountId: string): Promise<void> {
+  async deleteAccount(principalId: string, accountId: string): Promise<void> {
+    const accountResponse = await this.request(
+      `${this.apiUrl}/v1/connect/${encodeURIComponent(this.config.projectId)}/accounts/${encodeURIComponent(accountId)}?include_credentials=false`,
+      { headers: await this.headers() },
+    );
+    if (accountResponse.status === 404) return;
+    if (!accountResponse.ok) throw new Error(`Pipedream account lookup failed (HTTP ${accountResponse.status})`);
+    const account = await boundedJson(accountResponse);
+    if (account.external_id !== this.externalUserId(principalId)) {
+      throw new Error("Pipedream account does not belong to this user");
+    }
     const response = await this.request(
       `${this.apiUrl}/v1/connect/${encodeURIComponent(this.config.projectId)}/accounts/${encodeURIComponent(accountId)}`,
       { method: "DELETE", headers: await this.headers() },
@@ -314,6 +380,7 @@ export class PipedreamClient {
           name: tool.name,
           description: typeof tool.description === "string" ? tool.description : "",
           inputSchema: jsonObject(tool.inputSchema),
+          readOnly: jsonObject(tool.annotations).readOnlyHint === true,
         },
       ];
     });

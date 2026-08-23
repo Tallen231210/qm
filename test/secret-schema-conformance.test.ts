@@ -35,6 +35,7 @@ test("runtime schema conditions reference env vars the CLI schema also condition
     "DROPBOX_OAUTH_CLIENT_ID",
     "LINEAR_OAUTH_CLIENT_ID",
     "PIPEDREAM_CLIENT_ID",
+    "PIPEDREAM_BROKER_URL",
   ];
   const cliConditionEnv = new Set<string>();
   for (const spec of FIRST_PARTY_SECRET_SPECS) {

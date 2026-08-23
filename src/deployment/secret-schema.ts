@@ -13,6 +13,7 @@ type SecretGate =
   | "dropbox-oauth"
   | "linear-oauth"
   | "pipedream"
+  | "pipedream-broker"
   | "model-anthropic"
   | "model-openai"
   | "model-openrouter";
@@ -41,6 +42,7 @@ export const CORE_SECRET_SPECS: readonly RuntimeSecretSpec[] = [
   { name: "DROPBOX_OAUTH_CLIENT_SECRET", requiredWhen: "dropbox-oauth" },
   { name: "LINEAR_OAUTH_CLIENT_SECRET", requiredWhen: "linear-oauth" },
   { name: "PIPEDREAM_CLIENT_SECRET", requiredWhen: "pipedream" },
+  { name: "PIPEDREAM_BROKER_TOKEN", requiredWhen: "pipedream-broker" },
 ];
 
 const GATE_PREDICATES: Readonly<Record<SecretGate, (env: NodeJS.ProcessEnv) => boolean>> = {
@@ -56,6 +58,7 @@ const GATE_PREDICATES: Readonly<Record<SecretGate, (env: NodeJS.ProcessEnv) => b
   "dropbox-oauth": (env) => Boolean(env.DROPBOX_OAUTH_CLIENT_ID),
   "linear-oauth": (env) => Boolean(env.LINEAR_OAUTH_CLIENT_ID),
   pipedream: (env) => Boolean(env.PIPEDREAM_CLIENT_ID?.trim()),
+  "pipedream-broker": (env) => Boolean(env.PIPEDREAM_BROKER_URL?.trim()),
   "model-anthropic": (env) => env.MODEL_PROVIDER?.trim() === "anthropic",
   "model-openai": (env) => env.MODEL_PROVIDER?.trim() === "openai",
   "model-openrouter": (env) => env.MODEL_PROVIDER?.trim() === "openrouter",

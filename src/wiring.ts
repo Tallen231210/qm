@@ -99,6 +99,7 @@ import { createMcpServerStore, type McpServer, type McpServerStore } from "./mcp
 import { combineMcpToolServices, createMcpToolService, type McpToolService } from "./mcp/mcp-tool-service.ts";
 import { createIntegrationConnectionStore, type IntegrationConnection } from "./integrations/integration-store.ts";
 import { PipedreamClient } from "./integrations/pipedream-client.ts";
+import { PipedreamBrokerClient } from "./integrations/pipedream-broker-client.ts";
 import {
   createPipedreamIntegrationService,
   type PipedreamIntegrationService,
@@ -594,7 +595,9 @@ export function buildApp(
     artifactMap<IntegrationConnection>("integration_connections"),
   );
   const pipedreamBindingSecret = config.pipedream
-    ? (config.connectorSecretKey ?? config.signingSecret ?? config.pipedream.clientSecret)
+    ? (config.connectorSecretKey ??
+      config.signingSecret ??
+      (config.pipedream.mode === "direct" ? config.pipedream.clientSecret : config.pipedream.brokerToken))
     : undefined;
   const pipedream = createPipedreamIntegrationService({
     store: integrationConnections,
@@ -602,10 +605,22 @@ export function buildApp(
     ...(pipedreamBindingSecret ? { approvalSecret: pipedreamBindingSecret } : {}),
     ...(config.pipedream
       ? {
-          client: new PipedreamClient({
-            ...config.pipedream,
-            externalIdSecret: pipedreamBindingSecret!,
-          }),
+          client:
+            config.pipedream.mode === "direct"
+              ? new PipedreamClient({
+                  clientId: config.pipedream.clientId,
+                  clientSecret: config.pipedream.clientSecret,
+                  projectId: config.pipedream.projectId,
+                  environment: config.pipedream.environment,
+                  ...(config.pipedream.apiUrl ? { apiUrl: config.pipedream.apiUrl } : {}),
+                  ...(config.pipedream.mcpUrl ? { mcpUrl: config.pipedream.mcpUrl } : {}),
+                  externalIdSecret: pipedreamBindingSecret!,
+                })
+              : new PipedreamBrokerClient({
+                  url: config.pipedream.brokerUrl,
+                  token: config.pipedream.brokerToken,
+                  externalIdSecret: pipedreamBindingSecret!,
+                }),
         }
       : {}),
   });

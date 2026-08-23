@@ -50,7 +50,8 @@ The agent advertises only connectors whose admin configuration is enabled.
 Pipedream Connect can provide the user-facing Integrations catalog for business apps.
 Set `PIPEDREAM_CLIENT_ID`, `PIPEDREAM_PROJECT_ID`, and optionally
 `PIPEDREAM_ENVIRONMENT` in the core service environment, then provision
-`PIPEDREAM_CLIENT_SECRET` through `qm secrets`. Users connect their own accounts from
+`PIPEDREAM_CLIENT_SECRET` through `qm secrets`. A multitenant operator can instead set
+`PIPEDREAM_BROKER_URL` and provision a tenant-scoped `PIPEDREAM_BROKER_TOKEN`. Users connect their own accounts from
 the web UI without exposing provider credentials to QM or its agents. Accounts start
 personal and read-only, workspace sharing is explicit, and every external operation
 requires human approval.

@@ -4,6 +4,7 @@ import { createAuditLog } from "../src/audit/audit-log.ts";
 import { commandApprovalId } from "../src/core/approval-id.ts";
 import { createIntegrationConnectionStore } from "../src/integrations/integration-store.ts";
 import { PipedreamClient } from "../src/integrations/pipedream-client.ts";
+import { PipedreamBrokerClient } from "../src/integrations/pipedream-broker-client.ts";
 import { createPipedreamIntegrationService } from "../src/integrations/pipedream-service.ts";
 import { createMemoryMap } from "../src/persistence/durable-map.ts";
 
@@ -20,6 +21,7 @@ function fixture(options: { connectLinkUrl?: string; apps?: unknown[] } = {}) {
   const account = {
     id: "apn_123",
     name: "Acme HubSpot",
+    external_id: "",
     healthy: true,
     dead: false,
     app: { name_slug: "hubspot", name: "HubSpot", img_src: "https://example.test/hubspot.png" },
@@ -70,6 +72,9 @@ function fixture(options: { connectLinkUrl?: string; apps?: unknown[] } = {}) {
       });
     }
     if (url.includes("/accounts?") && method === "GET") return Response.json({ data: [account] });
+    if (url.includes("/accounts/apn_123") && method === "GET") {
+      return Response.json({ ...account, external_id: client.externalUserId("slack:U123") });
+    }
     if (url.includes("/accounts/apn_123") && method === "DELETE") return new Response(null, { status: 204 });
     if (url === "https://mcp.test/v3") {
       const result =
@@ -95,6 +100,95 @@ function fixture(options: { connectLinkUrl?: string; apps?: unknown[] } = {}) {
   return { client, requests };
 }
 
+test("Pipedream broker client sends only tenant-scoped requests", async () => {
+  const requests: RequestLog[] = [];
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const rawBody = typeof init?.body === "string" ? init.body : "";
+    const body = rawBody ? (JSON.parse(rawBody) as Record<string, unknown>) : {};
+    requests.push({
+      url: String(input),
+      method: init?.method ?? "GET",
+      headers: new Headers(init?.headers),
+      body,
+      signal: init?.signal ?? null,
+    });
+    if (String(input).includes("/apps?")) return Response.json({ apps: [{ nameSlug: "airtable", name: "Airtable" }] });
+    if (String(input).endsWith("/connect-link")) {
+      return Response.json({ url: "https://pipedream.com/_static/connect.html?token=ctok", expires_at: "soon" });
+    }
+    if (String(input).includes("/accounts?")) {
+      return Response.json({
+        accounts: [
+          {
+            id: "apn_123",
+            name: "Acme",
+            healthy: true,
+            dead: false,
+            app: { name_slug: "airtable", name: "Airtable" },
+            created_at: "now",
+            updated_at: "now",
+          },
+        ],
+      });
+    }
+    if (String(input).endsWith("/tools/list")) return Response.json({ tools: [] });
+    if (String(input).endsWith("/tools/call")) return Response.json({ result: "ok" });
+    return new Response(null, { status: 204 });
+  };
+  const client = new PipedreamBrokerClient(
+    {
+      url: "https://gateway.test/integrations",
+      token: "tenant_scoped_token",
+      externalIdSecret: "external-secret",
+    },
+    fetchImpl,
+  );
+  await client.listApps("airtable");
+  await client.createConnectLink("slack:U123", "airtable", "https://portal.test/integrations");
+  const [account] = await client.listAccounts("slack:U123");
+  await client.listTools({
+    externalUserId: client.externalUserId("slack:U123"),
+    ownerId: "slack:U123",
+    accountId: account!.id,
+    appSlug: account!.app.name_slug,
+  });
+  await client.callTool(
+    {
+      externalUserId: client.externalUserId("slack:U123"),
+      ownerId: "slack:U123",
+      accountId: account!.id,
+      appSlug: account!.app.name_slug,
+    },
+    "find_records",
+    { table: "Leads" },
+  );
+  await client.deleteAccount("slack:U123", account!.id);
+  assert.ok(requests.every((request) => request.headers.get("authorization") === "Bearer tenant_scoped_token"));
+  assert.ok(requests.every((request) => !request.url.includes("client_secret")));
+  assert.equal(requests.find((request) => request.url.endsWith("/tools/call"))?.body.principal_id, "slack:U123");
+});
+
+test("Pipedream broker client rejects untrusted Connect links", async () => {
+  const client = new PipedreamBrokerClient(
+    {
+      url: "https://gateway.test/integrations",
+      token: "tenant_scoped_token",
+      externalIdSecret: "external-secret",
+    },
+    async () => Response.json({ url: "https://attacker.test/_static/connect.html?token=stolen" }),
+  );
+  await assert.rejects(() => client.createConnectLink("slack:U123", "airtable"), /invalid link/);
+});
+
+test("Pipedream refuses to delete an account owned by another external user", async () => {
+  const { client, requests } = fixture();
+  await assert.rejects(() => client.deleteAccount("slack:other", "apn_123"), /does not belong/);
+  assert.equal(
+    requests.some((request) => request.method === "DELETE"),
+    false,
+  );
+});
+
 test("Pipedream client scopes Connect links and account reads to an opaque external user", async () => {
   const { client, requests } = fixture();
   const externalId = client.externalUserId("slack:U123");
@@ -112,6 +206,11 @@ test("Pipedream client scopes Connect links and account reads to an opaque exter
   const tokenRequest = requests.find((request) => request.url.endsWith("/tokens"));
   assert.equal(tokenRequest?.body.external_user_id, externalId);
   assert.equal(tokenRequest?.body.scope, "connect:accounts:read connect:accounts:write");
+  const oauthRequest = requests.find((request) => request.url.endsWith("/v1/oauth/token"));
+  assert.equal(
+    oauthRequest?.body.scope,
+    "connect:accounts:read connect:accounts:write connect:tokens:create connect:actions:*",
+  );
   const accounts = await client.listAccounts("slack:U123");
   assert.equal(accounts[0]?.id, "apn_123");
   const accountRequest = requests.find((request) => request.url.includes("/accounts?"));
@@ -197,15 +296,16 @@ test("integration policy defaults to personal read-only and gates every external
   const [connection] = await service.listOwned("slack:U123");
   assert.equal(connection?.access, "read");
   assert.deepEqual(connection?.scopes, ["personal:slack:U123"]);
-  await assert.rejects(
-    () =>
-      service.approvalFor!(
+  assert.match(
+    (
+      await service.approvalFor!(
         "integrations",
         { action: "call_tool", account_id: "apn_123", tool: "find_contact" },
         "slack:U123",
         "personal:slack:U123",
-      ),
-    /read-only/,
+      )
+    )?.approvalKey ?? "",
+    /^integration:apn_123:find_contact:/,
   );
   await assert.rejects(
     () =>
@@ -242,7 +342,10 @@ test("integration policy defaults to personal read-only and gates every external
     "slack:U999",
     "channel:C123",
   );
-  assert.match(writeApproval?.reason ?? "", /hubspot\/create_contact on account apn_123 with 0 argument fields/);
+  assert.match(
+    writeApproval?.reason ?? "",
+    /hubspot\/create_contact on Acme_HubSpot \(apn_123\) with 0 argument fields/,
+  );
   assert.match(writeApproval?.approvalKey ?? "", /^integration:apn_123:create_contact:[0-9a-f]{24}$/);
   assert.match(writeApproval?.command ?? "", /^integration hubspot\/create_contact/);
   const result = await service.call(
@@ -255,22 +358,11 @@ test("integration policy defaults to personal read-only and gates every external
   service.close();
 });
 
-test("a provider read-only hint never bypasses local write policy or human approval", async () => {
+test("provider read-only hints permit reads but never bypass human approval", async () => {
   const { client } = fixture();
   const store = createIntegrationConnectionStore(createMemoryMap());
   const service = createPipedreamIntegrationService({ client, store, approvalSecret: "approval-secret" });
   await service.listOwned("slack:U123");
-  await assert.rejects(
-    () =>
-      service.call(
-        "integrations",
-        { action: "call_tool", account_id: "apn_123", tool: "find_contact" },
-        "slack:U123",
-        "personal:slack:U123",
-      ),
-    /read-only/,
-  );
-  await service.updateOwned("slack:U123", "apn_123", { access: "read-write" });
   const approval = await service.approvalFor!(
     "integrations",
     { action: "call_tool", account_id: "apn_123", tool: "find_contact" },
@@ -278,6 +370,15 @@ test("a provider read-only hint never bypasses local write policy or human appro
     "personal:slack:U123",
   );
   assert.match(approval?.approvalKey ?? "", /^integration:apn_123:find_contact:[0-9a-f]{24}$/);
+  assert.equal(
+    await service.call(
+      "integrations",
+      { action: "call_tool", account_id: "apn_123", tool: "find_contact" },
+      "slack:U123",
+      "personal:slack:U123",
+    ),
+    "contact created",
+  );
 });
 
 test("approval identity binds canonical arguments and cannot collide in one batch", async () => {
@@ -325,9 +426,115 @@ test("approval identity binds canonical arguments and cannot collide in one batc
     commandApprovalId("session-1", approvalA?.command ?? ""),
     commandApprovalId("session-1", approvalB?.command ?? ""),
   );
-  assert.ok(!approvalA?.reason.includes("a@example.com"));
+  assert.match(approvalA?.reason ?? "", /a@example\.com/);
   assert.ok(!approvalA?.reason.includes("sk_live_sensitive_key"));
+  assert.match(approvalA?.reason ?? "", /\[redacted\]/);
   assert.match(approvalA?.reason ?? "", /with 3 argument fields/);
+  const semanticSecret = await service.approvalFor!(
+    "integrations",
+    {
+      action: "call_tool",
+      account_id: "apn_123",
+      tool: "create_contact",
+      arguments: { headers: [{ name: "Authorization", value: "Bearer sk_live_should_not_appear" }] },
+    },
+    "slack:U123",
+    "personal:slack:U123",
+  );
+  assert.ok(!semanticSecret?.reason.includes("sk_live_should_not_appear"));
+  assert.match(semanticSecret?.reason ?? "", /\[redacted\]/);
+  const keyValueSecret = await service.approvalFor!(
+    "integrations",
+    {
+      action: "call_tool",
+      account_id: "apn_123",
+      tool: "create_contact",
+      arguments: { headers: [{ key: "Authorization", value: "Basic dXNlcjpwYXNz" }] },
+    },
+    "slack:U123",
+    "personal:slack:U123",
+  );
+  assert.ok(!keyValueSecret?.reason.includes("dXNlcjpwYXNz"));
+  const longDestination = await service.approvalFor!(
+    "integrations",
+    {
+      action: "call_tool",
+      account_id: "apn_123",
+      tool: "create_contact",
+      arguments: { destination: `${"x".repeat(320)}victim@example.com` },
+    },
+    "slack:U123",
+    "personal:slack:U123",
+  );
+  assert.match(longDestination?.reason ?? "", /victim@example\.com/);
+  const secretUrl = await service.approvalFor!(
+    "integrations",
+    {
+      action: "call_tool",
+      account_id: "apn_123",
+      tool: "create_contact",
+      arguments: { url: "https://example.test/hook?api_key=supersecretvalue&target=visible" },
+    },
+    "slack:U123",
+    "personal:slack:U123",
+  );
+  assert.ok(!secretUrl?.reason.includes("supersecretvalue"));
+  assert.match(secretUrl?.reason ?? "", /target=visible/);
+  const signedUrl = await service.approvalFor!(
+    "integrations",
+    {
+      action: "call_tool",
+      account_id: "apn_123",
+      tool: "create_contact",
+      arguments: {
+        download: "https://storage.example/object?signature=signedsecret",
+        callback: "https://client.example/callback#access_token=fragmentsecret&state=visible",
+      },
+    },
+    "slack:U123",
+    "personal:slack:U123",
+  );
+  assert.ok(!signedUrl?.reason.includes("signedsecret"));
+  assert.ok(!signedUrl?.reason.includes("fragmentsecret"));
+  assert.match(signedUrl?.reason ?? "", /state=visible/);
+  const embeddedKey = await service.approvalFor!(
+    "integrations",
+    {
+      action: "call_tool",
+      account_id: "apn_123",
+      tool: "create_contact",
+      arguments: {
+        label: "prefix:sk_live_1234567890",
+        callback: "https://evil.example/collect?padding=sk_live_1234567890&target=visible",
+        instruction: "Basic transfer records to victim@example.com",
+        recipients: "https://example.test/send?recipient=approved@example.com&recipient=victim@example.com",
+      },
+    },
+    "slack:U123",
+    "personal:slack:U123",
+  );
+  assert.ok(!embeddedKey?.reason.includes("sk_live_1234567890"));
+  assert.match(embeddedKey?.reason ?? "", /evil\.example/);
+  assert.match(embeddedKey?.reason ?? "", /target=visible/);
+  assert.match(embeddedKey?.reason ?? "", /victim(?:@|%40)example\.com/);
+  assert.match(embeddedKey?.reason ?? "", /approved(?:@|%40)example\.com/);
+  await assert.rejects(
+    () =>
+      service.approvalFor!(
+        "integrations",
+        {
+          action: "call_tool",
+          account_id: "apn_123",
+          tool: "create_contact",
+          arguments: Object.fromEntries(
+            Array.from({ length: 80 }, (_, index) => [`destination_${index}`, "x".repeat(20)]),
+          ),
+        },
+        "slack:U123",
+        "personal:slack:U123",
+      ),
+    /too large to disclose safely/,
+  );
 });
 
 test("a late provider sync preserves a concurrent policy change", async () => {
@@ -371,6 +578,166 @@ test("a late provider sync preserves a concurrent policy change", async () => {
   assert.equal(connection?.accountName, "Acme HubSpot");
 });
 
+test("a stale sync from another instance cannot delete a newly connected account", async () => {
+  let releaseStale: (() => void) | undefined;
+  const staleGate = new Promise<void>((resolve) => {
+    releaseStale = resolve;
+  });
+  const stale = fixture();
+  stale.client.listAccounts = async () => {
+    await staleGate;
+    return [];
+  };
+  const current = fixture();
+  const store = createIntegrationConnectionStore(createMemoryMap());
+  const staleService = createPipedreamIntegrationService({
+    client: stale.client,
+    store,
+    approvalSecret: "approval-secret",
+  });
+  const currentService = createPipedreamIntegrationService({
+    client: current.client,
+    store,
+    approvalSecret: "approval-secret",
+  });
+  const staleSync = staleService.listOwned("slack:U123");
+  await currentService.listOwned("slack:U123");
+  releaseStale!();
+  await staleSync;
+  assert.equal((await store.get("apn_123"))?.accountName, "Acme HubSpot");
+});
+
+test("a stale sync from another instance cannot resurrect a disconnected account", async () => {
+  let releaseStale: (() => void) | undefined;
+  const staleGate = new Promise<void>((resolve) => {
+    releaseStale = resolve;
+  });
+  const current = fixture();
+  const stale = fixture();
+  const staleList = stale.client.listAccounts.bind(stale.client);
+  stale.client.listAccounts = async (principalId) => {
+    const snapshot = await staleList(principalId);
+    await staleGate;
+    return snapshot;
+  };
+  const store = createIntegrationConnectionStore(createMemoryMap());
+  const currentService = createPipedreamIntegrationService({
+    client: current.client,
+    store,
+    approvalSecret: "approval-secret",
+  });
+  const staleService = createPipedreamIntegrationService({
+    client: stale.client,
+    store,
+    approvalSecret: "approval-secret",
+  });
+  await currentService.listOwned("slack:U123");
+  const staleSync = staleService.listOwned("slack:U123");
+  assert.equal(await currentService.deleteOwned("slack:U123", "apn_123"), true);
+  releaseStale!();
+  await staleSync;
+  const connection = await store.get("apn_123");
+  assert.equal(connection?.healthy, false);
+  assert.deepEqual(connection?.scopes, []);
+  assert.ok(connection?.disconnectedAt);
+});
+
+test("disconnect hides the account before provider deletion and remains retryable", async () => {
+  const { client } = fixture();
+  const store = createIntegrationConnectionStore(createMemoryMap());
+  const service = createPipedreamIntegrationService({ client, store, approvalSecret: "approval-secret" });
+  await service.listOwned("slack:U123");
+  const providerDelete = client.deleteAccount.bind(client);
+  let attempts = 0;
+  client.deleteAccount = async (principalId, accountId) => {
+    attempts += 1;
+    await providerDelete(principalId, accountId);
+    if (attempts === 1) throw new Error("provider response was lost");
+  };
+  await assert.rejects(() => service.deleteOwned("slack:U123", "apn_123"), /response was lost/);
+  const disconnected = await store.get("apn_123");
+  assert.equal(disconnected?.healthy, false);
+  assert.deepEqual(disconnected?.scopes, []);
+  assert.ok(disconnected?.disconnectedAt);
+  assert.deepEqual(await service.listOwned("slack:U123"), []);
+  assert.equal(attempts, 2);
+});
+
+test("a failed pending disconnect does not hide unrelated active accounts", async () => {
+  const { client } = fixture();
+  const providerList = client.listAccounts.bind(client);
+  client.listAccounts = async (principalId) => [
+    ...(await providerList(principalId)),
+    {
+      id: "apn_456",
+      name: "Acme Sheets",
+      healthy: true,
+      dead: false,
+      app: { name_slug: "google_sheets", name: "Google Sheets" },
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z",
+    },
+  ];
+  let attempts = 0;
+  client.deleteAccount = async () => {
+    attempts += 1;
+    throw new Error("provider unavailable");
+  };
+  const store = createIntegrationConnectionStore(createMemoryMap());
+  const service = createPipedreamIntegrationService({ client, store, approvalSecret: "approval-secret" });
+  assert.equal((await service.listOwned("slack:U123")).length, 2);
+  await assert.rejects(() => service.deleteOwned("slack:U123", "apn_123"), /provider unavailable/);
+  assert.deepEqual(
+    (await service.listOwned("slack:U123")).map((connection) => connection.accountId),
+    ["apn_456"],
+  );
+  assert.equal(attempts, 2);
+  assert.deepEqual(
+    (await service.listOwned("slack:U123")).map((connection) => connection.accountId),
+    ["apn_456"],
+  );
+  assert.equal(attempts, 3);
+});
+
+test("disconnect never reaches the provider when its durable tombstone fails", async () => {
+  const { client, requests } = fixture();
+  const durable = createIntegrationConnectionStore(createMemoryMap());
+  let failUpdate = false;
+  const store = {
+    ...durable,
+    update: async (...args: Parameters<typeof durable.update>) => {
+      if (failUpdate) throw new Error("durable write failed");
+      return durable.update(...args);
+    },
+  };
+  const service = createPipedreamIntegrationService({ client, store, approvalSecret: "approval-secret" });
+  await service.listOwned("slack:U123");
+  failUpdate = true;
+  await assert.rejects(() => service.deleteOwned("slack:U123", "apn_123"), /durable write failed/);
+  assert.equal(
+    requests.some((request) => request.method === "DELETE"),
+    false,
+  );
+});
+
+test("Pipedream deletion treats a missing provider account as already disconnected", async () => {
+  const client = new PipedreamClient(
+    {
+      clientId: "client",
+      clientSecret: "secret",
+      projectId: "proj_test",
+      environment: "development",
+      externalIdSecret: "external-secret",
+      apiUrl: "https://api.test",
+    },
+    async (input) =>
+      String(input).endsWith("/v1/oauth/token")
+        ? Response.json({ access_token: "pd_access", expires_in: 3600 })
+        : Response.json({ error: "missing" }, { status: 404 }),
+  );
+  await client.deleteAccount("slack:U123", "apn_missing");
+});
+
 test("Pipedream rejects oversized responses before materializing them", async () => {
   const fetchImpl: typeof fetch = async (input) => {
     if (String(input).endsWith("/v1/oauth/token")) {
@@ -389,6 +756,78 @@ test("Pipedream rejects oversized responses before materializing them", async ()
     fetchImpl,
   );
   await assert.rejects(() => client.listAccounts("slack:U123"), /size limit/);
+});
+
+test("Pipedream rejects plaintext direct endpoint overrides", () => {
+  const base = {
+    clientId: "client",
+    clientSecret: "secret",
+    projectId: "proj_test",
+    environment: "development" as const,
+    externalIdSecret: "external-secret",
+  };
+  assert.throws(() => new PipedreamClient({ ...base, apiUrl: "http://api.test" }), /HTTPS URL/);
+  assert.throws(() => new PipedreamClient({ ...base, mcpUrl: "https://user:pass@mcp.test" }), /HTTPS URL/);
+});
+
+test("Pipedream account synchronization follows pagination and tolerates unnamed accounts", async () => {
+  const requests: string[] = [];
+  const fetchImpl: typeof fetch = async (input) => {
+    const url = String(input);
+    requests.push(url);
+    if (url.endsWith("/v1/oauth/token")) return Response.json({ access_token: "pd_access", expires_in: 3600 });
+    if (url.includes("after=next")) {
+      return Response.json({
+        data: [
+          {
+            id: "apn_2",
+            name: null,
+            healthy: true,
+            dead: false,
+            app: { name_slug: "hubspot", name: "HubSpot" },
+            created_at: "",
+            updated_at: "",
+          },
+        ],
+        page_info: { count: 1, total_count: 2, end_cursor: "done" },
+      });
+    }
+    return Response.json({
+      data: [
+        {
+          id: "apn_1",
+          name: "First",
+          healthy: true,
+          dead: false,
+          app: { name_slug: "hubspot", name: "HubSpot" },
+          created_at: "",
+          updated_at: "",
+        },
+      ],
+      page_info: { count: 1, total_count: 2, end_cursor: "next" },
+    });
+  };
+  const client = new PipedreamClient(
+    {
+      clientId: "client",
+      clientSecret: "secret",
+      projectId: "proj_test",
+      environment: "development",
+      externalIdSecret: "external-secret",
+    },
+    fetchImpl,
+  );
+  const store = createIntegrationConnectionStore(createMemoryMap());
+  const service = createPipedreamIntegrationService({ client, store, approvalSecret: "approval-secret" });
+  const accounts = await service.listOwned("slack:U123");
+  assert.deepEqual(
+    accounts.map((account) => [account.accountId, account.accountName]),
+    [
+      ["apn_1", "First"],
+      ["apn_2", "HubSpot"],
+    ],
+  );
+  assert.ok(requests.some((url) => url.includes("after=next")));
 });
 
 test("integration audit records policy deltas and call outcomes without arguments", async () => {

@@ -1,7 +1,7 @@
 import type { DurableMap } from "../persistence/durable-map.ts";
 import type { ScopeId } from "../types.ts";
 
-export type IntegrationAccess = "read" | "read-write";
+type IntegrationAccess = "read" | "read-write";
 
 export interface IntegrationConnection {
   accountId: string;
@@ -14,6 +14,7 @@ export interface IntegrationConnection {
   healthy: boolean;
   scopes: ScopeId[];
   access: IntegrationAccess;
+  disconnectedAt?: number;
   createdAt: number;
   updatedAt: number;
 }

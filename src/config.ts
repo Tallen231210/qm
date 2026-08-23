@@ -86,14 +86,17 @@ export interface Config {
   portalIdentitySecret?: string;
   requireSignedPortalIdentity?: boolean;
   connectorSecretKey?: string;
-  pipedream?: {
-    clientId: string;
-    clientSecret: string;
-    projectId: string;
-    environment: "development" | "production";
-    apiUrl?: string;
-    mcpUrl?: string;
-  };
+  pipedream?:
+    | {
+        mode: "direct";
+        clientId: string;
+        clientSecret: string;
+        projectId: string;
+        environment: "development" | "production";
+        apiUrl?: string;
+        mcpUrl?: string;
+      }
+    | { mode: "broker"; brokerUrl: string; brokerToken: string };
   secretsBackend: "env" | "aws";
   secretsPrefix: string;
   apiBaseUrl?: string;
@@ -616,15 +619,31 @@ function modelProviderEnvStrict(env: NodeJS.ProcessEnv): ModelProvider | undefin
 }
 
 function pipedreamCompletenessEnvStrict(env: NodeJS.ProcessEnv): void {
-  const values = [env.PIPEDREAM_CLIENT_ID, env.PIPEDREAM_CLIENT_SECRET, env.PIPEDREAM_PROJECT_ID].map((value) =>
+  const direct = [env.PIPEDREAM_CLIENT_ID, env.PIPEDREAM_CLIENT_SECRET, env.PIPEDREAM_PROJECT_ID].map((value) =>
     value?.trim(),
   );
-  if (values.some(Boolean) && !values.every(Boolean)) {
+  const broker = [env.PIPEDREAM_BROKER_URL, env.PIPEDREAM_BROKER_TOKEN].map((value) => value?.trim());
+  if (direct.some(Boolean) && !direct.every(Boolean)) {
     throw new Error("PIPEDREAM_CLIENT_ID, PIPEDREAM_CLIENT_SECRET, and PIPEDREAM_PROJECT_ID must be set together");
+  }
+  if (broker.some(Boolean) && !broker.every(Boolean)) {
+    throw new Error("PIPEDREAM_BROKER_URL and PIPEDREAM_BROKER_TOKEN must be set together");
+  }
+  if (direct.some(Boolean) && broker.some(Boolean)) {
+    throw new Error("Configure Pipedream directly or through a broker, not both");
   }
 }
 
 function pipedreamEnvStrict(env: NodeJS.ProcessEnv): Config["pipedream"] {
+  const brokerUrl = env.PIPEDREAM_BROKER_URL?.trim();
+  const brokerToken = env.PIPEDREAM_BROKER_TOKEN;
+  if (brokerUrl && brokerToken?.trim()) {
+    const parsed = new URL(brokerUrl);
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.search || parsed.hash) {
+      throw new Error("PIPEDREAM_BROKER_URL must be an HTTPS URL without credentials, query, or fragment");
+    }
+    return { mode: "broker", brokerUrl: parsed.toString().replace(/\/$/, ""), brokerToken };
+  }
   const clientId = env.PIPEDREAM_CLIENT_ID?.trim();
   const clientSecret = env.PIPEDREAM_CLIENT_SECRET;
   const projectId = env.PIPEDREAM_PROJECT_ID?.trim();
@@ -636,6 +655,7 @@ function pipedreamEnvStrict(env: NodeJS.ProcessEnv): Config["pipedream"] {
     throw new Error('PIPEDREAM_ENVIRONMENT must be "development" or "production"');
   }
   return {
+    mode: "direct",
     clientId,
     clientSecret,
     projectId,
