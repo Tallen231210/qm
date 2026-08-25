@@ -358,6 +358,61 @@ test("integration policy defaults to personal read-only and gates every external
   service.close();
 });
 
+test("broker integrations are company-wide while management and audit retain the acting person", async () => {
+  const { client } = fixture();
+  const store = createIntegrationConnectionStore(createMemoryMap());
+  const toolActors: string[] = [];
+  const callActors: string[] = [];
+  const listTools = client.listTools.bind(client);
+  const callTool = client.callTool.bind(client);
+  client.listTools = async (connection) => {
+    toolActors.push((connection as typeof connection & { ownerId: string }).ownerId);
+    return listTools(connection);
+  };
+  client.callTool = async (connection, name, args) => {
+    callActors.push((connection as typeof connection & { ownerId: string }).ownerId);
+    return callTool(connection, name, args);
+  };
+  const service = createPipedreamIntegrationService({
+    client,
+    store,
+    approvalSecret: "approval-secret",
+    sharedScopeId: "org:acme",
+  });
+  await service.listOwned("web:owner@acme.test");
+  await service.updateOwned("web:owner@acme.test", "apn_123", { access: "read-write" });
+  assert.deepEqual(
+    JSON.parse(await service.call("integrations", { action: "list_accounts" }, "slack:U999", "channel:C1")),
+    [
+      {
+        account_id: "apn_123",
+        app: "hubspot",
+        app_name: "HubSpot",
+        account: "Acme HubSpot",
+        healthy: true,
+        access: "read-write",
+      },
+    ],
+  );
+  assert.equal(
+    await service.call(
+      "integrations",
+      { action: "call_tool", account_id: "apn_123", tool: "create_contact" },
+      "slack:U999",
+      "channel:C1",
+    ),
+    "contact created",
+  );
+  const connection = await store.get("apn_123");
+  assert.equal(connection?.ownerId, "web:owner@acme.test");
+  assert.deepEqual(connection?.scopes, ["org:acme"]);
+  assert.equal(connection?.access, "read-write");
+  assert.deepEqual(toolActors, ["slack:U999"]);
+  assert.deepEqual(callActors, ["slack:U999"]);
+  assert.equal(await service.updateOwned("slack:U999", "apn_123", { access: "read" }), null);
+  assert.equal(await service.deleteOwned("slack:U999", "apn_123"), false);
+});
+
 test("provider read-only hints permit reads but never bypass human approval", async () => {
   const { client } = fixture();
   const store = createIntegrationConnectionStore(createMemoryMap());

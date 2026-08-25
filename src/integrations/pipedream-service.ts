@@ -57,6 +57,7 @@ function connectionFromAccount(
   account: PipedreamAccount,
   principalId: string,
   externalUserId: string,
+  defaultScopeId: ScopeId,
   existing: IntegrationConnection | null,
   now: number,
 ): IntegrationConnection {
@@ -69,7 +70,7 @@ function connectionFromAccount(
     accountName: account.name?.trim() || account.app.name,
     ...(account.app.img_src ? { imageUrl: account.app.img_src } : {}),
     healthy: account.healthy && !account.dead,
-    scopes: existing?.ownerId === principalId ? existing.scopes : [personalScope(principalId)],
+    scopes: existing?.ownerId === principalId ? existing.scopes : [defaultScopeId],
     access: existing?.ownerId === principalId ? existing.access : "read",
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
@@ -193,6 +194,7 @@ export function createPipedreamIntegrationService(opts: {
   store: IntegrationConnectionStore;
   audit?: AuditLog;
   approvalSecret?: string;
+  sharedScopeId?: ScopeId;
   now?: () => number;
 }): PipedreamIntegrationService {
   if (opts.client && !opts.approvalSecret) throw new Error("Pipedream integrations require an approval binding secret");
@@ -225,14 +227,29 @@ export function createPipedreamIntegrationService(opts: {
       const externalUserId = opts.client.externalUserId(principalId);
       const synced: IntegrationConnection[] = [];
       for (const account of accounts) {
-        const incoming = connectionFromAccount(account, principalId, externalUserId, null, now());
+        const incoming = connectionFromAccount(
+          account,
+          principalId,
+          externalUserId,
+          opts.sharedScopeId ?? personalScope(principalId),
+          null,
+          now(),
+        );
         await opts.store.putIfAbsent(incoming);
         const connection =
           (await opts.store.update(account.id, (current) => ({
-            ...(current.disconnectedAt ? current : incoming),
-            scopes: current.ownerId === principalId ? current.scopes : incoming.scopes,
-            access: current.ownerId === principalId ? current.access : incoming.access,
-            createdAt: current.ownerId === principalId ? current.createdAt : incoming.createdAt,
+            ...(current.disconnectedAt
+              ? current
+              : {
+                  ...current,
+                  appSlug: incoming.appSlug,
+                  appName: incoming.appName,
+                  accountName: incoming.accountName,
+                  ...(incoming.imageUrl ? { imageUrl: incoming.imageUrl } : {}),
+                  healthy: incoming.healthy,
+                  scopes: opts.sharedScopeId ? [...new Set([...current.scopes, opts.sharedScopeId])] : current.scopes,
+                  updatedAt: incoming.updatedAt,
+                }),
           }))) ?? incoming;
         if (connection.disconnectedAt) {
           if (connection.ownerId === principalId) {
@@ -256,7 +273,10 @@ export function createPipedreamIntegrationService(opts: {
   async function available(principalId: string, scopeId?: string): Promise<IntegrationConnection[]> {
     const scope = scopeId ?? personalScope(principalId);
     return (await opts.store.list()).filter(
-      (connection) => !connection.disconnectedAt && connection.scopes.includes(scope),
+      (connection) =>
+        !connection.disconnectedAt &&
+        (connection.scopes.includes(scope) ||
+          (opts.sharedScopeId !== undefined && connection.scopes.includes(opts.sharedScopeId))),
     );
   }
 
@@ -277,11 +297,11 @@ export function createPipedreamIntegrationService(opts: {
     return selected;
   }
 
-  async function toolsFor(connection: IntegrationConnection): Promise<PipedreamTool[]> {
+  async function toolsFor(connection: IntegrationConnection, principalId: string): Promise<PipedreamTool[]> {
     if (!opts.client) return [];
     const cached = toolCache.get(connection.accountId);
     if (cached && now() - cached.at < TOOL_CACHE_MS) return cached.tools;
-    const tools = await opts.client.listTools(connection);
+    const tools = await opts.client.listTools({ ...connection, ownerId: principalId });
     toolCache.set(connection.accountId, { at: now(), tools });
     return tools;
   }
@@ -333,7 +353,9 @@ export function createPipedreamIntegrationService(opts: {
         priorScopes = current.scopes;
         return {
           ...current,
-          ...(patch.scopes ? { scopes: [...new Set([personalScope(principalId), ...patch.scopes])] } : {}),
+          ...(patch.scopes
+            ? { scopes: [...new Set([opts.sharedScopeId ?? personalScope(principalId), ...patch.scopes])] }
+            : {}),
           ...(patch.access ? { access: patch.access } : {}),
           updatedAt: now(),
         };
@@ -393,7 +415,7 @@ export function createPipedreamIntegrationService(opts: {
       const toolName = typeof args.tool === "string" ? args.tool : "";
       let tool: PipedreamTool | undefined;
       try {
-        tool = (await toolsFor(connection)).find((candidate) => candidate.name === toolName);
+        tool = (await toolsFor(connection, principalId)).find((candidate) => candidate.name === toolName);
       } catch (error) {
         record(principalId, "tool.authorize", connection.accountId, scopeId, "failed", {
           app: connection.appSlug,
@@ -421,6 +443,7 @@ export function createPipedreamIntegrationService(opts: {
       if (name !== TOOL_NAME) throw new Error(`unknown integration tool: ${name}`);
       if (!principalId) throw new Error("integration calls require an acting user");
       if (args.action === "list_accounts") {
+        await syncOwned(principalId);
         const connections = await available(principalId, scopeId);
         return JSON.stringify(
           connections.map(({ accountId, appSlug, appName, accountName, healthy, access }) => ({
@@ -444,7 +467,7 @@ export function createPipedreamIntegrationService(opts: {
       if (args.action === "list_tools") {
         try {
           return JSON.stringify(
-            (await toolsFor(connection)).map(({ name: tool, description, inputSchema, readOnly }) => ({
+            (await toolsFor(connection, principalId)).map(({ name: tool, description, inputSchema, readOnly }) => ({
               tool,
               description,
               input_schema: inputSchema,
@@ -464,7 +487,7 @@ export function createPipedreamIntegrationService(opts: {
       if (!toolName) throw new Error("tool is required for call_tool");
       let tool: PipedreamTool | undefined;
       try {
-        tool = (await toolsFor(connection)).find((candidate) => candidate.name === toolName);
+        tool = (await toolsFor(connection, principalId)).find((candidate) => candidate.name === toolName);
       } catch (error) {
         record(principalId, "tool.call", connection.accountId, scopeId, "failed", {
           app: connection.appSlug,
@@ -488,7 +511,7 @@ export function createPipedreamIntegrationService(opts: {
       }
       const toolArgs = toolArguments(args);
       try {
-        const result = await opts.client!.callTool(connection, toolName, toolArgs);
+        const result = await opts.client!.callTool({ ...connection, ownerId: principalId }, toolName, toolArgs);
         record(principalId, "tool.call", connection.accountId, scopeId, "ok", {
           app: connection.appSlug,
           tool: toolName,

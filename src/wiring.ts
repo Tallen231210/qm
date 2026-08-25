@@ -602,6 +602,7 @@ export function buildApp(
   const pipedream = createPipedreamIntegrationService({
     store: integrationConnections,
     audit: auditLog,
+    ...(config.pipedream?.mode === "broker" ? { sharedScopeId: `org:${config.orgId}` } : {}),
     ...(pipedreamBindingSecret ? { approvalSecret: pipedreamBindingSecret } : {}),
     ...(config.pipedream
       ? {
