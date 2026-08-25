@@ -185,6 +185,10 @@ test("keychain rows reserve success badges for actionable states", () => {
   assert.doesNotMatch(connectorsSource, />Connected<\/span>/);
   assert.match(connectorsSource, /expired \? html`<span class="kc-state warning">Expired<\/span>` : ""/);
   assert.match(connectorsSource, /<span class="kc-state warning">Reconnect needed<\/span>/);
+  assert.match(
+    connectorsSource,
+    /connection\.healthy && \(!connection\.targetRequired \|\| connection\.target\?\.verified === true\)/,
+  );
 });
 
 test("keychain actions keep secondary weight and compact mobile sizing", () => {
@@ -211,4 +215,8 @@ test("managed integrations choose an app before opening Pipedream Connect", () =
   assert.match(connectorsSource, /not an agency-level account spanning multiple clients/);
   assert.match(connectorsSource, /Provider authorization may include broad read and write access/);
   assert.match(connectorsSource, /await startManagedIntegration\(appSlug, true\)/);
+  assert.match(connectorsSource, /Verified \$\{connection\.target\.type\}: \$\{connection\.target\.name\}/);
+  assert.match(connectorsSource, /\$\{connection\.appName\} target identity is not verified/);
+  assert.match(connectorsSource, /Integration actions stay blocked/);
+  assert.match(connectorsSource, /Disconnect and reconnect/);
 });

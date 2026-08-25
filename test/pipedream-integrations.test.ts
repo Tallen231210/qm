@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createAuditLog } from "../src/audit/audit-log.ts";
 import { commandApprovalId } from "../src/core/approval-id.ts";
 import { createIntegrationConnectionStore } from "../src/integrations/integration-store.ts";
-import { PipedreamClient } from "../src/integrations/pipedream-client.ts";
+import { PipedreamClient, type PipedreamAccount } from "../src/integrations/pipedream-client.ts";
 import { PipedreamBrokerClient } from "../src/integrations/pipedream-broker-client.ts";
 import { createPipedreamIntegrationService } from "../src/integrations/pipedream-service.ts";
 import { createMemoryMap } from "../src/persistence/durable-map.ts";
@@ -126,6 +126,7 @@ test("Pipedream broker client sends only tenant-scoped requests", async () => {
             healthy: true,
             dead: false,
             app: { name_slug: "airtable", name: "Airtable" },
+            target: { type: "base", id: "base_123", name: "Sales CRM", verified: true },
             created_at: "now",
             updated_at: "now",
           },
@@ -148,6 +149,7 @@ test("Pipedream broker client sends only tenant-scoped requests", async () => {
   await client.createConnectLink("slack:U123", "airtable", "https://portal.test/integrations");
   const [account] = await client.listAccounts("slack:U123");
   assert.equal(client.managementOwnerId(account!, "slack:U123"), "owner@acme.test");
+  assert.deepEqual(account?.target, { type: "base", id: "base_123", name: "Sales CRM", verified: true });
   await client.listTools({
     externalUserId: client.externalUserId("slack:U123"),
     ownerId: "slack:U123",
@@ -160,6 +162,7 @@ test("Pipedream broker client sends only tenant-scoped requests", async () => {
       ownerId: "slack:U123",
       accountId: account!.id,
       appSlug: account!.app.name_slug,
+      target: account!.target,
     },
     "find_records",
     { table: "Leads" },
@@ -168,6 +171,7 @@ test("Pipedream broker client sends only tenant-scoped requests", async () => {
   assert.ok(requests.every((request) => request.headers.get("authorization") === "Bearer tenant_scoped_token"));
   assert.ok(requests.every((request) => !request.url.includes("client_secret")));
   assert.equal(requests.find((request) => request.url.endsWith("/tools/call"))?.body.principal_id, "slack:U123");
+  assert.equal(requests.find((request) => request.url.endsWith("/tools/call"))?.body.target_id, "base_123");
 });
 
 test("Pipedream broker client rejects untrusted Connect links", async () => {
@@ -414,6 +418,425 @@ test("broker integrations are company-wide while management and audit retain the
   assert.deepEqual(callActors, ["slack:U999"]);
   assert.equal(await service.updateOwned("slack:U999", "apn_123", { access: "read" }), null);
   assert.equal(await service.deleteOwned("slack:U999", "apn_123"), false);
+});
+
+test("direct HighLevel accounts remain usable without broker target attestations", async () => {
+  const client = {
+    externalUserId: () => "tenant",
+    listApps: async () => [],
+    createConnectLink: async () => ({ url: "https://pipedream.com/_static/connect.html", expiresAt: "soon" }),
+    listAccounts: async (): Promise<PipedreamAccount[]> => [
+      {
+        id: "apn_direct_highlevel",
+        name: "HighLevel",
+        healthy: true,
+        dead: false,
+        app: { name_slug: "highlevel_oauth", name: "HighLevel" },
+        created_at: "2026-08-25T10:00:00Z",
+        updated_at: "2026-08-25T10:00:00Z",
+      },
+    ],
+    deleteAccount: async () => {},
+    listTools: async () => [
+      { name: "find_contact", description: "Find contact", inputSchema: { type: "object" }, readOnly: true },
+    ],
+    callTool: async () => "found",
+  };
+  const store = createIntegrationConnectionStore(createMemoryMap());
+  const service = createPipedreamIntegrationService({ client, store, approvalSecret: "approval-secret" });
+  const [connection] = await service.listOwned("owner@acme.test");
+  assert.equal(connection?.targetRequired, undefined);
+  assert.equal(
+    await service.call(
+      "integrations",
+      { action: "call_tool", account_id: "apn_direct_highlevel", tool: "find_contact" },
+      "owner@acme.test",
+      "personal:owner@acme.test",
+    ),
+    "found",
+  );
+  service.close();
+});
+
+test("HighLevel writes name the verified sub-account and fail closed without it", async () => {
+  const target = { type: "location", id: "location_123", name: "Acme Dental - Miami", verified: true as const };
+  const account = {
+    id: "apn_highlevel",
+    name: "HighLevel",
+    healthy: true,
+    dead: false,
+    app: { name_slug: "highlevel_oauth", name: "HighLevel" },
+    created_at: "2026-08-25T10:00:00Z",
+    updated_at: "2026-08-25T10:00:00Z",
+    target_required: true,
+    target,
+  };
+  const tool = {
+    name: "highlevel_oauth-create-contact",
+    description: "Create contact",
+    inputSchema: { type: "object" },
+    readOnly: false,
+  };
+  let currentTarget: typeof target | undefined = target;
+  let currentUpdatedAt = account.updated_at;
+  let failCall = false;
+  const client = {
+    externalUserId: () => "tenant",
+    listApps: async () => [],
+    createConnectLink: async () => ({ url: "https://pipedream.com/_static/connect.html", expiresAt: "soon" }),
+    listAccounts: async () => [{ ...account, updated_at: currentUpdatedAt, target: currentTarget }],
+    deleteAccount: async () => {},
+    listTools: async () => [tool],
+    callTool: async () => {
+      if (failCall) throw new Error("provider failed");
+      return "created";
+    },
+  };
+  const store = createIntegrationConnectionStore(createMemoryMap());
+  const audit = createAuditLog();
+  const service = createPipedreamIntegrationService({ client, store, audit, approvalSecret: "approval-secret" });
+  await service.listOwned("owner@acme.test");
+  await service.updateOwned("owner@acme.test", account.id, { access: "read-write" });
+  const listed = JSON.parse(
+    await service.call("integrations", { action: "list_accounts" }, "owner@acme.test", "personal:owner@acme.test"),
+  );
+  assert.deepEqual(listed[0], {
+    account_id: "apn_highlevel",
+    app: "highlevel_oauth",
+    app_name: "HighLevel",
+    account: "HighLevel",
+    target_required: true,
+    target_type: "location",
+    target_id: "location_123",
+    target_name: "Acme Dental - Miami",
+    target_verified: true,
+    healthy: true,
+    access: "read-write",
+  });
+  const approval = await service.approvalFor!(
+    "integrations",
+    {
+      action: "call_tool",
+      account_id: account.id,
+      target_id: "location_123",
+      tool: tool.name,
+      arguments: { email: "lead@example.com" },
+    },
+    "owner@acme.test",
+    "personal:owner@acme.test",
+  );
+  assert.match(approval?.reason ?? "", /verified location Acme_Dental_-_Miami \(location_123\).*lead@example\.com/);
+  assert.equal(
+    await service.call(
+      "integrations",
+      { action: "call_tool", account_id: account.id, target_id: "location_123", tool: tool.name },
+      "owner@acme.test",
+      "personal:owner@acme.test",
+    ),
+    "created",
+  );
+  failCall = true;
+  await assert.rejects(
+    () =>
+      service.call(
+        "integrations",
+        { action: "call_tool", account_id: account.id, target_id: "location_123", tool: tool.name },
+        "owner@acme.test",
+        "personal:owner@acme.test",
+      ),
+    /provider failed/,
+  );
+  const targetedCalls = (await audit.events()).filter(
+    (event) => event.action === "integration.tool.call" && event.detail?.includes('"target_id":"location_123"'),
+  );
+  assert.deepEqual(
+    targetedCalls.map((event) => event.status),
+    ["ok", "failed"],
+  );
+  currentTarget = { ...target, id: "location_456", name: "Acme Dental - Orlando" };
+  currentUpdatedAt = "2026-08-25T11:00:00Z";
+  await service.listOwned("owner@acme.test");
+  assert.equal((await store.get(account.id))?.target, undefined);
+  assert.equal((await store.get(account.id))?.lastVerifiedTargetId, "location_123");
+  await assert.rejects(
+    () =>
+      service.call(
+        "integrations",
+        { action: "call_tool", account_id: account.id, target_id: "location_456", tool: tool.name },
+        "owner@acme.test",
+        "personal:owner@acme.test",
+      ),
+    /current verified target_id/,
+  );
+  currentTarget = { ...target, name: "Acme Dental renamed" };
+  currentUpdatedAt = "2026-08-25T12:00:00Z";
+  await service.listOwned("owner@acme.test");
+  assert.deepEqual((await store.get(account.id))?.target, {
+    ...target,
+    name: "Acme Dental renamed",
+  });
+  currentTarget = undefined;
+  currentUpdatedAt = "2026-08-25T13:00:00Z";
+  await service.listOwned("owner@acme.test");
+  assert.equal((await store.get(account.id))?.target, undefined);
+  await assert.rejects(
+    () =>
+      service.approvalFor!(
+        "integrations",
+        { action: "call_tool", account_id: account.id, tool: tool.name },
+        "owner@acme.test",
+        "personal:owner@acme.test",
+      ),
+    /current verified target_id/,
+  );
+  await assert.rejects(
+    () =>
+      service.call(
+        "integrations",
+        { action: "call_tool", account_id: account.id, tool: tool.name },
+        "owner@acme.test",
+        "personal:owner@acme.test",
+      ),
+    /current verified target_id/,
+  );
+  assert.deepEqual(
+    (await audit.events())
+      .filter((event) => event.status === "refused" && event.detail?.includes("target_unverified"))
+      .map((event) => event.action),
+    ["integration.tool.call", "integration.tool.authorize", "integration.tool.call"],
+  );
+  service.close();
+});
+
+test("verified generic targets bind reads and clear when the provider retracts them", async () => {
+  const targetId = `base_${"x".repeat(300)}`;
+  let target: PipedreamAccount["target"] = { type: "base", id: targetId, name: "Sales", verified: true };
+  let updatedAt = "2026-08-25T10:00:00Z";
+  const account: PipedreamAccount = {
+    id: "apn_airtable",
+    name: "Airtable",
+    healthy: true,
+    dead: false,
+    app: { name_slug: "airtable", name: "Airtable" },
+    created_at: "now",
+    updated_at: updatedAt,
+    target,
+  };
+  const client = {
+    externalUserId: () => "tenant",
+    listApps: async () => [],
+    createConnectLink: async () => ({ url: "https://pipedream.com/_static/connect.html", expiresAt: "soon" }),
+    listAccounts: async () => [{ ...account, updated_at: updatedAt, target }],
+    deleteAccount: async () => {},
+    listTools: async () => [
+      { name: "list_records", description: "List records", inputSchema: { type: "object" }, readOnly: true },
+    ],
+    callTool: async () => "listed",
+  };
+  const store = createIntegrationConnectionStore(createMemoryMap());
+  const service = createPipedreamIntegrationService({ client, store, approvalSecret: "approval-secret" });
+  await service.listOwned("owner@acme.test");
+  await assert.rejects(
+    () =>
+      service.approvalFor!(
+        "integrations",
+        { action: "call_tool", account_id: account.id, tool: "list_records" },
+        "owner@acme.test",
+        "personal:owner@acme.test",
+      ),
+    /current verified target_id/,
+  );
+  const approval = await service.approvalFor!(
+    "integrations",
+    { action: "call_tool", account_id: account.id, target_id: targetId, tool: "list_records" },
+    "owner@acme.test",
+    "personal:owner@acme.test",
+  );
+  assert.match(approval?.reason ?? "", /~[0-9a-f]{12}\)/);
+  assert.equal((await store.get(account.id))?.target?.id, targetId);
+  target = undefined;
+  updatedAt = "2026-08-25T11:00:00Z";
+  await service.listOwned("owner@acme.test");
+  assert.equal((await store.get(account.id))?.target, undefined);
+  target = { type: "base", id: targetId, name: "Sales renamed", verified: true };
+  updatedAt = "2026-08-25T12:00:00Z";
+  await service.listOwned("owner@acme.test");
+  assert.deepEqual((await store.get(account.id))?.target, {
+    type: "base",
+    id: targetId,
+    name: "Sales renamed",
+    verified: true,
+  });
+  service.close();
+});
+
+test("same-version target conflicts stay blocked until a newer attestation", async () => {
+  const account = (id: string, updatedAt: string): PipedreamAccount => ({
+    id: "apn_highlevel",
+    name: "HighLevel",
+    healthy: true,
+    dead: false,
+    app: { name_slug: "highlevel_oauth", name: "HighLevel" },
+    created_at: "2026-08-25T09:00:00Z",
+    updated_at: updatedAt,
+    target_required: true,
+    target: { type: "location", id, name: id, verified: true },
+  });
+  const client = (value: PipedreamAccount) => ({
+    externalUserId: () => "tenant",
+    managementOwnerId: () => "owner@acme.test",
+    listApps: async () => [],
+    createConnectLink: async () => ({ url: "https://pipedream.com/_static/connect.html", expiresAt: "soon" }),
+    listAccounts: async () => [value],
+    deleteAccount: async () => {},
+    listTools: async () => [],
+    callTool: async () => "",
+  });
+  const store = createIntegrationConnectionStore(createMemoryMap());
+  const service = (value: PipedreamAccount) =>
+    createPipedreamIntegrationService({
+      client: client(value),
+      store,
+      approvalSecret: "approval-secret",
+      sharedScopeId: "org:acme",
+    });
+  const trusted = service(account("location_a", "2026-08-25T10:00:00Z"));
+  await trusted.listOwned("slack:U1");
+  const conflict = service(account("location_b", "2026-08-25T10:00:00Z"));
+  await conflict.listOwned("slack:U2");
+  assert.equal((await store.get("apn_highlevel"))?.target, undefined);
+  await trusted.listOwned("slack:U1");
+  assert.equal((await store.get("apn_highlevel"))?.target, undefined);
+  const recovered = service(account("location_a", "2026-08-25T11:00:00Z"));
+  await recovered.listOwned("slack:U3");
+  assert.equal((await store.get("apn_highlevel"))?.target?.id, "location_a");
+  trusted.close();
+  conflict.close();
+  recovered.close();
+});
+
+test("a stale provider sync cannot revert a newer verified target", async () => {
+  let releaseStale: (() => void) | undefined;
+  const staleGate = new Promise<void>((resolve) => {
+    releaseStale = resolve;
+  });
+  const account = (id: string, updatedAt: string): PipedreamAccount => ({
+    id: "apn_highlevel",
+    name: "HighLevel",
+    healthy: true,
+    dead: false,
+    app: { name_slug: "highlevel_oauth", name: "HighLevel" },
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: updatedAt,
+    target_required: true,
+    target: { type: "location", id, name: id, verified: true },
+  });
+  const client = (value: PipedreamAccount, gate?: Promise<void>) => ({
+    externalUserId: () => "tenant",
+    managementOwnerId: () => "owner@acme.test",
+    listApps: async () => [],
+    createConnectLink: async () => ({ url: "https://pipedream.com/_static/connect.html", expiresAt: "soon" }),
+    listAccounts: async () => {
+      if (gate) await gate;
+      return [value];
+    },
+    deleteAccount: async () => {},
+    listTools: async () => [],
+    callTool: async () => "",
+  });
+  const store = createIntegrationConnectionStore(createMemoryMap());
+  const stale = createPipedreamIntegrationService({
+    client: client(account("location_old", "2026-08-25T10:00:00Z"), staleGate),
+    store,
+    approvalSecret: "approval-secret",
+    sharedScopeId: "org:acme",
+  });
+  const current = createPipedreamIntegrationService({
+    client: client(account("location_new", "2026-08-25T11:00:00Z")),
+    store,
+    approvalSecret: "approval-secret",
+    sharedScopeId: "org:acme",
+  });
+  const staleSync = stale.listOwned("slack:U1");
+  await current.listOwned("slack:U2");
+  releaseStale!();
+  await staleSync;
+  assert.equal((await store.get("apn_highlevel"))?.target?.id, "location_new");
+  stale.close();
+  current.close();
+});
+
+test("unversioned provider accounts can become unhealthy without reviving trust", async () => {
+  let healthy = true;
+  let target: PipedreamAccount["target"] = { type: "base", id: "base_1", name: "Base", verified: true };
+  const client = {
+    externalUserId: () => "tenant",
+    listApps: async () => [],
+    createConnectLink: async () => ({ url: "https://pipedream.com/_static/connect.html", expiresAt: "soon" }),
+    listAccounts: async (): Promise<PipedreamAccount[]> => [
+      {
+        id: "apn_unversioned",
+        name: "Airtable",
+        healthy,
+        dead: false,
+        app: { name_slug: "airtable", name: "Airtable" },
+        created_at: "",
+        updated_at: "",
+        target,
+      },
+    ],
+    deleteAccount: async () => {},
+    listTools: async () => [],
+    callTool: async () => "",
+  };
+  const store = createIntegrationConnectionStore(createMemoryMap());
+  const service = createPipedreamIntegrationService({ client, store, approvalSecret: "approval-secret" });
+  await service.listOwned("owner@acme.test");
+  healthy = false;
+  target = { type: "base", id: "base_2", name: "Other", verified: true };
+  await service.listOwned("owner@acme.test");
+  const connection = await store.get("apn_unversioned");
+  assert.equal(connection?.healthy, false);
+  assert.equal(connection?.target, undefined);
+  healthy = true;
+  await service.listOwned("owner@acme.test");
+  assert.equal((await store.get("apn_unversioned"))?.healthy, false);
+  service.close();
+});
+
+test("same-version provider accounts can become unhealthy and padded targets fail closed", async () => {
+  let healthy = true;
+  let target: PipedreamAccount["target"] = { type: "location", id: "location_1", name: "Main", verified: true };
+  const client = {
+    externalUserId: () => "tenant",
+    listApps: async () => [],
+    createConnectLink: async () => ({ url: "https://pipedream.com/_static/connect.html", expiresAt: "soon" }),
+    listAccounts: async (): Promise<PipedreamAccount[]> => [
+      {
+        id: "apn_highlevel",
+        name: "HighLevel",
+        healthy,
+        dead: false,
+        app: { name_slug: "highlevel_oauth", name: "HighLevel" },
+        created_at: "2026-08-25T10:00:00Z",
+        updated_at: "2026-08-25T10:00:00Z",
+        target,
+      },
+    ],
+    deleteAccount: async () => {},
+    listTools: async () => [],
+    callTool: async () => "",
+  };
+  const store = createIntegrationConnectionStore(createMemoryMap());
+  const service = createPipedreamIntegrationService({ client, store, approvalSecret: "approval-secret" });
+  await service.listOwned("owner@acme.test");
+  healthy = false;
+  await service.listOwned("owner@acme.test");
+  assert.equal((await store.get("apn_highlevel"))?.healthy, false);
+  target = { ...target, id: " location_1 " };
+  await service.listOwned("owner@acme.test");
+  assert.equal((await store.get("apn_highlevel"))?.target, undefined);
+  service.close();
 });
 
 test("provider read-only hints permit reads but never bypass human approval", async () => {

@@ -10,6 +10,15 @@ export interface IntegrationConnection {
   appSlug: string;
   appName: string;
   accountName: string;
+  targetRequired?: boolean;
+  target?: {
+    type: string;
+    id: string;
+    name: string;
+    verified: true;
+  };
+  lastVerifiedTargetId?: string;
+  providerUpdatedAt?: number;
   imageUrl?: string;
   healthy: boolean;
   scopes: ScopeId[];

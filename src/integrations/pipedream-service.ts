@@ -1,4 +1,4 @@
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import type { AuditLog } from "../audit/audit-log.ts";
 import type { McpServer } from "../mcp/mcp-server-store.ts";
 import type { McpToolDescriptor, McpToolService } from "../mcp/mcp-tool-service.ts";
@@ -29,6 +29,10 @@ const descriptor: McpToolDescriptor = {
       action: { type: "string", enum: ["list_accounts", "list_tools", "call_tool"] },
       app: { type: "string", description: "Connected app slug, such as hubspot or google_sheets" },
       account_id: { type: "string", description: "Connected account ID from list_accounts" },
+      target_id: {
+        type: "string",
+        description: "Verified target ID from list_accounts, required for every call on a targeted account",
+      },
       tool: { type: "string", description: "Remote tool name from list_tools" },
       arguments: { type: "object", description: "Arguments matching the selected tool schema" },
     },
@@ -61,6 +65,26 @@ function connectionFromAccount(
   existing: IntegrationConnection | null,
   now: number,
 ): IntegrationConnection {
+  const providerTarget = account.target;
+  const validProviderTarget =
+    providerTarget?.verified === true &&
+    typeof providerTarget.type === "string" &&
+    typeof providerTarget.id === "string" &&
+    typeof providerTarget.name === "string" &&
+    providerTarget.type.trim() &&
+    providerTarget.id.trim() &&
+    providerTarget.id === providerTarget.id.trim() &&
+    providerTarget.name.trim();
+  let target: IntegrationConnection["target"];
+  if (validProviderTarget) {
+    target = {
+      type: providerTarget.type.trim().slice(0, 80),
+      id: providerTarget.id,
+      name: providerTarget.name.trim().slice(0, 240),
+      verified: true as const,
+    };
+  }
+  const targetRequired = account.target_required === true || existing?.targetRequired === true || target !== undefined;
   return {
     accountId: account.id,
     externalUserId,
@@ -68,6 +92,10 @@ function connectionFromAccount(
     appSlug: account.app.name_slug,
     appName: account.app.name,
     accountName: account.name?.trim() || account.app.name,
+    ...(targetRequired ? { targetRequired: true } : {}),
+    ...(target ? { target } : {}),
+    ...(target ? { lastVerifiedTargetId: target.id } : {}),
+    ...(Number.isFinite(Date.parse(account.updated_at)) ? { providerUpdatedAt: Date.parse(account.updated_at) } : {}),
     ...(account.app.img_src ? { imageUrl: account.app.img_src } : {}),
     healthy: account.healthy && !account.dead,
     scopes: existing?.ownerId === ownerId ? existing.scopes : [defaultScopeId],
@@ -140,7 +168,9 @@ function approvalValue(value: unknown, key = ""): unknown {
   if (Array.isArray(value)) return value.map((entry) => approvalValue(entry));
   if (value && typeof value === "object") {
     const named = value as Record<string, unknown>;
-    const discriminator = typeof named.name === "string" ? named.name : typeof named.key === "string" ? named.key : "";
+    let discriminator = "";
+    if (typeof named.name === "string") discriminator = named.name;
+    else if (typeof named.key === "string") discriminator = named.key;
     const namedSecret = SENSITIVE_FIELD.test(discriminator);
     return Object.fromEntries(
       Object.entries(named).map(([childKey, entry]) => [
@@ -160,6 +190,27 @@ function safeLabel(value: string): string {
   return value.replace(/[^a-zA-Z0-9_.:/-]+/g, "_").slice(0, 80) || "unknown";
 }
 
+function targetIdentityLabel(value: string): string {
+  const normalized = value.replace(/[^a-zA-Z0-9_.:/-]+/g, "_");
+  if (normalized === value && normalized.length <= 80) return normalized || "unknown";
+  const digest = createHash("sha256").update(value).digest("hex").slice(0, 12);
+  return `${normalized.slice(0, 64) || "unknown"}~${digest}`;
+}
+
+function toolAuditDetail(
+  connection: IntegrationConnection,
+  tool: string,
+  detail: Record<string, unknown> = {},
+): Record<string, unknown> {
+  const target = connection.target;
+  return {
+    app: connection.appSlug,
+    tool,
+    ...(target?.verified ? { target_type: target.type, target_id: target.id } : {}),
+    ...detail,
+  };
+}
+
 function approvalDetails(
   connection: IntegrationConnection,
   tool: PipedreamTool,
@@ -167,21 +218,26 @@ function approvalDetails(
   secret: string,
 ): { reason: string; approvalKey: string; command: string } {
   const toolArgs = toolArguments(args);
+  const targetIdentity = connection.target?.verified ? [connection.target.type, connection.target.id] : null;
   const digest = createHmac("sha256", secret)
-    .update(JSON.stringify([connection.accountId, tool.name, canonicalValue(toolArgs)]))
+    .update(JSON.stringify([connection.accountId, targetIdentity, tool.name, canonicalValue(toolArgs)]))
     .digest("hex")
     .slice(0, 24);
   const app = safeLabel(connection.appSlug);
   const toolName = safeLabel(tool.name);
   const account = safeLabel(connection.accountId);
   const accountName = safeLabel(connection.accountName);
+  const target = connection.target;
+  const destination = target?.verified
+    ? `; verified ${safeLabel(target.type)} ${safeLabel(target.name)} (${targetIdentityLabel(target.id)})`
+    : "";
   const fieldCount = Object.keys(toolArgs).length;
   const canonicalArgs = canonicalValue(toolArgs);
   if (Buffer.byteLength(JSON.stringify(canonicalArgs)) > 1200) {
     throw new Error("Integration arguments are too large to disclose safely for approval");
   }
   const safeArgs = JSON.stringify(approvalValue(canonicalArgs));
-  const operation = `${app}/${toolName} on ${accountName} (${account}) with ${fieldCount} argument field${fieldCount === 1 ? "" : "s"}: ${safeArgs}`;
+  const operation = `${app}/${toolName} on ${accountName} (${account})${destination} with ${fieldCount} argument field${fieldCount === 1 ? "" : "s"}: ${safeArgs}`;
   return {
     reason: `External integration operation requires approval: ${operation}`,
     approvalKey: `integration:${account}:${toolName}:${digest}`,
@@ -227,30 +283,73 @@ export function createPipedreamIntegrationService(opts: {
       const externalUserId = opts.client.externalUserId(principalId);
       const synced: IntegrationConnection[] = [];
       for (const account of accounts) {
+        const existing = await opts.store.get(account.id);
         const incoming = connectionFromAccount(
           account,
           opts.client.managementOwnerId?.(account, principalId) ?? principalId,
           externalUserId,
           opts.sharedScopeId ?? personalScope(principalId),
-          null,
+          existing,
           now(),
         );
         await opts.store.putIfAbsent(incoming);
         const connection =
-          (await opts.store.update(account.id, (current) => ({
-            ...(current.disconnectedAt
-              ? current
-              : {
-                  ...current,
-                  appSlug: incoming.appSlug,
-                  appName: incoming.appName,
-                  accountName: incoming.accountName,
-                  ...(incoming.imageUrl ? { imageUrl: incoming.imageUrl } : {}),
-                  healthy: incoming.healthy,
-                  scopes: opts.sharedScopeId ? [...new Set([...current.scopes, opts.sharedScopeId])] : current.scopes,
-                  updatedAt: incoming.updatedAt,
-                }),
-          }))) ?? incoming;
+          (await opts.store.update(account.id, (current) => {
+            if (current.disconnectedAt) return current;
+            const currentProviderUpdatedAt = current.providerUpdatedAt;
+            const incomingProviderUpdatedAt = incoming.providerUpdatedAt;
+            const newer =
+              incomingProviderUpdatedAt !== undefined &&
+              (currentProviderUpdatedAt === undefined || incomingProviderUpdatedAt > currentProviderUpdatedAt);
+            const equal =
+              incomingProviderUpdatedAt !== undefined && incomingProviderUpdatedAt === currentProviderUpdatedAt;
+            const older =
+              incomingProviderUpdatedAt !== undefined &&
+              currentProviderUpdatedAt !== undefined &&
+              incomingProviderUpdatedAt < currentProviderUpdatedAt;
+            const lastVerifiedTargetId = current.lastVerifiedTargetId ?? current.target?.id;
+            let target: IntegrationConnection["target"];
+            if (older) target = current.target;
+            else if (
+              incoming.target &&
+              (lastVerifiedTargetId === undefined ||
+                (incoming.target.id === lastVerifiedTargetId && (current.target !== undefined || newer)))
+            )
+              target = incoming.target;
+            const nextLastVerifiedTargetId = lastVerifiedTargetId ?? target?.id;
+            let providerState: Partial<IntegrationConnection> = {};
+            if (newer) {
+              providerState = {
+                appSlug: incoming.appSlug,
+                appName: incoming.appName,
+                accountName: incoming.accountName,
+                ...(incoming.imageUrl ? { imageUrl: incoming.imageUrl } : {}),
+                healthy: incoming.healthy,
+                providerUpdatedAt: incomingProviderUpdatedAt,
+              };
+            } else if (incomingProviderUpdatedAt === undefined) {
+              providerState = {
+                appSlug: incoming.appSlug,
+                appName: incoming.appName,
+                accountName: incoming.accountName,
+                ...(incoming.imageUrl ? { imageUrl: incoming.imageUrl } : {}),
+                healthy: current.healthy && incoming.healthy,
+              };
+            } else if (equal) {
+              providerState = {
+                healthy: current.healthy && incoming.healthy,
+              };
+            }
+            return {
+              ...current,
+              ...providerState,
+              target,
+              ...(nextLastVerifiedTargetId ? { lastVerifiedTargetId: nextLastVerifiedTargetId } : {}),
+              ...(incoming.targetRequired ? { targetRequired: true } : {}),
+              scopes: opts.sharedScopeId ? [...new Set([...current.scopes, opts.sharedScopeId])] : current.scopes,
+              updatedAt: incoming.updatedAt,
+            };
+          })) ?? incoming;
         if (connection.disconnectedAt) {
           if (connection.ownerId === principalId) {
             try {
@@ -304,6 +403,31 @@ export function createPipedreamIntegrationService(opts: {
     const tools = await opts.client.listTools({ ...connection, ownerId: principalId });
     toolCache.set(connection.accountId, { at: now(), tools });
     return tools;
+  }
+
+  function assertVerifiedTarget(
+    principalId: string,
+    action: "tool.authorize" | "tool.call",
+    connection: IntegrationConnection,
+    tool: PipedreamTool,
+    args: Record<string, unknown>,
+    scopeId: string | undefined,
+  ): void {
+    const requestedTargetId = typeof args.target_id === "string" ? args.target_id.trim() : "";
+    if (connection.target?.verified === true && requestedTargetId === connection.target.id) return;
+    if (connection.targetRequired || connection.target?.verified === true) {
+      record(
+        principalId,
+        action,
+        connection.accountId,
+        scopeId,
+        "refused",
+        toolAuditDetail(connection, tool.name, {
+          reason: connection.target?.verified === true ? "target_mismatch" : "target_unverified",
+        }),
+      );
+      throw new Error("Integration access requires the current verified target_id from list_accounts");
+    }
   }
 
   return {
@@ -417,24 +541,37 @@ export function createPipedreamIntegrationService(opts: {
       try {
         tool = (await toolsFor(connection, principalId)).find((candidate) => candidate.name === toolName);
       } catch (error) {
-        record(principalId, "tool.authorize", connection.accountId, scopeId, "failed", {
-          app: connection.appSlug,
-          tool: toolName,
-        });
+        record(
+          principalId,
+          "tool.authorize",
+          connection.accountId,
+          scopeId,
+          "failed",
+          toolAuditDetail(connection, toolName),
+        );
         throw error;
       }
       if (!tool) {
-        record(principalId, "tool.authorize", connection.accountId, scopeId, "refused", {
-          app: connection.appSlug,
-          tool: toolName,
-        });
+        record(
+          principalId,
+          "tool.authorize",
+          connection.accountId,
+          scopeId,
+          "refused",
+          toolAuditDetail(connection, toolName),
+        );
         throw new Error(`Unknown ${connection.appName} tool: ${toolName || "(missing)"}`);
       }
+      assertVerifiedTarget(principalId, "tool.authorize", connection, tool, args, scopeId);
       if (connection.access !== "read-write" && !tool.readOnly) {
-        record(principalId, "tool.authorize", connection.accountId, scopeId, "refused", {
-          app: connection.appSlug,
-          tool: tool.name,
-        });
+        record(
+          principalId,
+          "tool.authorize",
+          connection.accountId,
+          scopeId,
+          "refused",
+          toolAuditDetail(connection, tool.name),
+        );
         throw new Error(`${connection.appName} is read-only; enable write access in Integrations first`);
       }
       return approvalDetails(connection, tool, args, opts.approvalSecret!);
@@ -446,11 +583,20 @@ export function createPipedreamIntegrationService(opts: {
         await syncOwned(principalId);
         const connections = await available(principalId, scopeId);
         return JSON.stringify(
-          connections.map(({ accountId, appSlug, appName, accountName, healthy, access }) => ({
+          connections.map(({ accountId, appSlug, appName, accountName, targetRequired, target, healthy, access }) => ({
             account_id: accountId,
             app: appSlug,
             app_name: appName,
             account: accountName,
+            ...(targetRequired ? { target_required: true } : {}),
+            ...(target?.verified
+              ? {
+                  target_type: target.type,
+                  target_id: target.id,
+                  target_name: target.name,
+                  target_verified: true,
+                }
+              : {}),
             healthy,
             access,
           })),
@@ -489,39 +635,53 @@ export function createPipedreamIntegrationService(opts: {
       try {
         tool = (await toolsFor(connection, principalId)).find((candidate) => candidate.name === toolName);
       } catch (error) {
-        record(principalId, "tool.call", connection.accountId, scopeId, "failed", {
-          app: connection.appSlug,
-          tool: toolName,
-        });
+        record(
+          principalId,
+          "tool.call",
+          connection.accountId,
+          scopeId,
+          "failed",
+          toolAuditDetail(connection, toolName),
+        );
         throw error;
       }
       if (!tool) {
-        record(principalId, "tool.call", connection.accountId, scopeId, "refused", {
-          app: connection.appSlug,
-          tool: toolName,
-        });
+        record(
+          principalId,
+          "tool.call",
+          connection.accountId,
+          scopeId,
+          "refused",
+          toolAuditDetail(connection, toolName),
+        );
         throw new Error(`Unknown ${connection.appName} tool: ${toolName}`);
       }
+      assertVerifiedTarget(principalId, "tool.call", connection, tool, args, scopeId);
       if (connection.access !== "read-write" && !tool.readOnly) {
-        record(principalId, "tool.call", connection.accountId, scopeId, "refused", {
-          app: connection.appSlug,
-          tool: toolName,
-        });
+        record(
+          principalId,
+          "tool.call",
+          connection.accountId,
+          scopeId,
+          "refused",
+          toolAuditDetail(connection, toolName),
+        );
         throw new Error(`${connection.appName} is read-only; enable write access in Integrations first`);
       }
       const toolArgs = toolArguments(args);
       try {
         const result = await opts.client!.callTool({ ...connection, ownerId: principalId }, toolName, toolArgs);
-        record(principalId, "tool.call", connection.accountId, scopeId, "ok", {
-          app: connection.appSlug,
-          tool: toolName,
-        });
+        record(principalId, "tool.call", connection.accountId, scopeId, "ok", toolAuditDetail(connection, toolName));
         return result;
       } catch (error) {
-        record(principalId, "tool.call", connection.accountId, scopeId, "failed", {
-          app: connection.appSlug,
-          tool: toolName,
-        });
+        record(
+          principalId,
+          "tool.call",
+          connection.accountId,
+          scopeId,
+          "failed",
+          toolAuditDetail(connection, toolName),
+        );
         throw error;
       }
     },

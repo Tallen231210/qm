@@ -21,6 +21,13 @@ interface ManagedIntegration {
   appSlug: string;
   appName: string;
   accountName: string;
+  targetRequired?: boolean;
+  target?: {
+    type: string;
+    id: string;
+    name: string;
+    verified: true;
+  };
   healthy: boolean;
   scopes: string[];
   access: "read" | "read-write";
@@ -30,6 +37,21 @@ interface ManagedIntegrationApp {
   nameSlug: string;
   name: string;
   description?: string;
+}
+
+function managedIntegrationTarget(connection: ManagedIntegration): TemplateResult | string {
+  if (connection.target?.verified) {
+    return html`<div class="kc-resource-meta">
+      Verified ${connection.target.type}: ${connection.target.name} · ${connection.target.id}
+    </div>`;
+  }
+  if (connection.targetRequired) {
+    return html`<div class="kc-inline-warning" role="status">
+      ${connection.appName} target identity is not verified. Integration actions stay blocked. Disconnect and reconnect
+      the intended account.
+    </div>`;
+  }
+  return "";
 }
 
 const CONNECTOR_LABELS: Record<string, { name: string; hosts: string; desc?: string }> = {
@@ -622,6 +644,7 @@ function drawConnectors(loading = false): void {
   const managedCards = managedIntegrations.map((connection) => {
     const currentScope = scopedSession.active?.scopeId;
     const sharedHere = currentScope ? connection.scopes.includes(currentScope) : false;
+    const ready = connection.healthy && (!connection.targetRequired || connection.target?.verified === true);
     return html`
       <article class="kc-resource kc-account">
         <div class="kc-resource-main">
@@ -630,12 +653,13 @@ function drawConnectors(loading = false): void {
             <div class="kc-resource-title-row">
               <h3>${connection.appName}</h3>
               ${
-                connection.healthy
+                ready
                   ? html`<span class="kc-state success">Ready</span>`
                   : html`<span class="kc-state warning">Reconnect needed</span>`
               }
             </div>
             <div class="kc-resource-meta">${connection.accountName}</div>
+            ${managedIntegrationTarget(connection)}
           </div>
         </div>
         <p class="kc-resource-description">

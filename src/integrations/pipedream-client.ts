@@ -36,6 +36,13 @@ export interface PipedreamAccount {
   created_at: string;
   updated_at: string;
   error?: string;
+  target_required?: boolean;
+  target?: {
+    type: string;
+    id: string;
+    name: string;
+    verified: true;
+  };
 }
 
 export interface PipedreamApp {
@@ -69,7 +76,13 @@ export interface PipedreamConnectClient {
     appSlug: string;
   }): Promise<PipedreamTool[]>;
   callTool(
-    connection: { externalUserId: string; ownerId: string; accountId: string; appSlug: string },
+    connection: {
+      externalUserId: string;
+      ownerId: string;
+      accountId: string;
+      appSlug: string;
+      target?: { type: string; id: string; name: string; verified: true };
+    },
     name: string,
     args: Record<string, unknown>,
   ): Promise<string>;

@@ -153,7 +153,13 @@ export class PipedreamBrokerClient implements PipedreamConnectClient {
   }
 
   async callTool(
-    connection: { externalUserId: string; ownerId: string; accountId: string; appSlug: string },
+    connection: {
+      externalUserId: string;
+      ownerId: string;
+      accountId: string;
+      appSlug: string;
+      target?: { type: string; id: string; name: string; verified: true };
+    },
     name: string,
     args: Record<string, unknown>,
   ): Promise<string> {
@@ -164,6 +170,7 @@ export class PipedreamBrokerClient implements PipedreamConnectClient {
         account_id: connection.accountId,
         app: connection.appSlug,
         tool: name,
+        ...(connection.target?.verified ? { target_id: connection.target.id } : {}),
         arguments: args,
       }),
     });
