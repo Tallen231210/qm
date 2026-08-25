@@ -55,7 +55,7 @@ export interface PipedreamIntegrationService extends McpToolService {
 
 function connectionFromAccount(
   account: PipedreamAccount,
-  principalId: string,
+  ownerId: string,
   externalUserId: string,
   defaultScopeId: ScopeId,
   existing: IntegrationConnection | null,
@@ -64,14 +64,14 @@ function connectionFromAccount(
   return {
     accountId: account.id,
     externalUserId,
-    ownerId: principalId,
+    ownerId,
     appSlug: account.app.name_slug,
     appName: account.app.name,
     accountName: account.name?.trim() || account.app.name,
     ...(account.app.img_src ? { imageUrl: account.app.img_src } : {}),
     healthy: account.healthy && !account.dead,
-    scopes: existing?.ownerId === principalId ? existing.scopes : [defaultScopeId],
-    access: existing?.ownerId === principalId ? existing.access : "read",
+    scopes: existing?.ownerId === ownerId ? existing.scopes : [defaultScopeId],
+    access: existing?.ownerId === ownerId ? existing.access : "read",
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
   };
@@ -229,7 +229,7 @@ export function createPipedreamIntegrationService(opts: {
       for (const account of accounts) {
         const incoming = connectionFromAccount(
           account,
-          principalId,
+          opts.client.managementOwnerId?.(account, principalId) ?? principalId,
           externalUserId,
           opts.sharedScopeId ?? personalScope(principalId),
           null,

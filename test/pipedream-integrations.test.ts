@@ -122,6 +122,7 @@ test("Pipedream broker client sends only tenant-scoped requests", async () => {
           {
             id: "apn_123",
             name: "Acme",
+            management_owner_id: "owner@acme.test",
             healthy: true,
             dead: false,
             app: { name_slug: "airtable", name: "Airtable" },
@@ -146,6 +147,7 @@ test("Pipedream broker client sends only tenant-scoped requests", async () => {
   await client.listApps("airtable");
   await client.createConnectLink("slack:U123", "airtable", "https://portal.test/integrations");
   const [account] = await client.listAccounts("slack:U123");
+  assert.equal(client.managementOwnerId(account!, "slack:U123"), "owner@acme.test");
   await client.listTools({
     externalUserId: client.externalUserId("slack:U123"),
     ownerId: "slack:U123",
@@ -365,6 +367,7 @@ test("broker integrations are company-wide while management and audit retain the
   const callActors: string[] = [];
   const listTools = client.listTools.bind(client);
   const callTool = client.callTool.bind(client);
+  Object.assign(client, { managementOwnerId: () => "web:owner@acme.test" });
   client.listTools = async (connection) => {
     toolActors.push((connection as typeof connection & { ownerId: string }).ownerId);
     return listTools(connection);
@@ -379,7 +382,7 @@ test("broker integrations are company-wide while management and audit retain the
     approvalSecret: "approval-secret",
     sharedScopeId: "org:acme",
   });
-  await service.listOwned("web:owner@acme.test");
+  await service.call("integrations", { action: "list_accounts" }, "slack:U999", "channel:C1");
   await service.updateOwned("web:owner@acme.test", "apn_123", { access: "read-write" });
   assert.deepEqual(
     JSON.parse(await service.call("integrations", { action: "list_accounts" }, "slack:U999", "channel:C1")),

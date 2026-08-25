@@ -53,6 +53,7 @@ export interface PipedreamTool {
 
 export interface PipedreamConnectClient {
   externalUserId(principalId: string): string;
+  managementOwnerId?(account: PipedreamAccount, principalId: string): string;
   listApps(query: string): Promise<PipedreamApp[]>;
   createConnectLink(
     principalId: string,

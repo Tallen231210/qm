@@ -71,6 +71,11 @@ export class PipedreamBrokerClient implements PipedreamConnectClient {
     return `qm_${createHmac("sha256", this.config.externalIdSecret).update(principalId).digest("hex").slice(0, 40)}`;
   }
 
+  managementOwnerId(account: PipedreamAccount, principalId: string): string {
+    const value = (account as PipedreamAccount & { management_owner_id?: unknown }).management_owner_id;
+    return typeof value === "string" && value.trim() ? value.trim() : principalId;
+  }
+
   private async request(path: string, init: RequestInit = {}): Promise<Record<string, unknown>> {
     const response = await this.fetchImpl(`${this.base}${path}`, {
       ...init,
