@@ -85,6 +85,10 @@ export class KeychainOperations {
     return load === this.latestLoad;
   }
 
+  invalidateLoads(): void {
+    this.latestLoad++;
+  }
+
   isCurrentEpoch(epoch: number): boolean {
     return epoch === this.epoch;
   }

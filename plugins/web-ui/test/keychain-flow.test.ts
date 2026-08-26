@@ -86,6 +86,13 @@ test("a reversed keychain load cannot overwrite the latest response", async () =
   assert.match(connectorsSource, /keychainOperations\.isCurrentLoad\(load\)/);
 });
 
+test("a completed mutation can invalidate an older integrations load", () => {
+  const operations = new KeychainOperations();
+  const load = operations.beginLoad();
+  operations.invalidateLoads();
+  assert.equal(operations.isCurrentLoad(load), false);
+});
+
 test("identity reset invalidates a pending connector start", async () => {
   const operations = new KeychainOperations();
   const operation = operations.beginNavigation()!;
@@ -219,4 +226,20 @@ test("managed integrations choose an app before opening Pipedream Connect", () =
   assert.match(connectorsSource, /\$\{connection\.appName\} target identity is not verified/);
   assert.match(connectorsSource, /Integration actions stay blocked/);
   assert.match(connectorsSource, /Disconnect and reconnect/);
+});
+
+test("managed integration policy changes render the canonical saved account without a stale reload", () => {
+  const start = connectorsSource.indexOf("async function updateManagedIntegration");
+  const end = connectorsSource.indexOf("async function toggleManagedIntegrationScope", start);
+  const policySource = connectorsSource.slice(start, end);
+  const [successSource, errorSource] = policySource.split("} catch (error) {");
+  assert.match(policySource, /api<\{ account\?: ManagedIntegration \}>/);
+  assert.match(policySource, /const saved = result\.account/);
+  assert.match(policySource, /saved\.accountId !== connection\.accountId/);
+  assert.match(policySource, /isCurrentEpoch\(operation\.epoch\)/);
+  assert.match(policySource, /keychainOperations\.invalidateLoads\(\)/);
+  assert.match(policySource, /managedIntegrations = managedIntegrations\.map/);
+  assert.match(policySource, /current\.accountId === saved\.accountId \? saved : current/);
+  assert.doesNotMatch(successSource, /renderConnectors\(\)/);
+  assert.match(errorSource ?? "", /await renderConnectors\(\)/);
 });

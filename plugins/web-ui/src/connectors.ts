@@ -1200,16 +1200,29 @@ async function updateManagedIntegration(
   const operation = beginKeychainMutation();
   if (!operation) return;
   try {
-    await api(`/api/integrations/accounts/${encodeURIComponent(connection.accountId)}`, {
-      method: "PUT",
-      body: JSON.stringify(patch),
-    });
+    const result = await api<{ account?: ManagedIntegration }>(
+      `/api/integrations/accounts/${encodeURIComponent(connection.accountId)}`,
+      {
+        method: "PUT",
+        body: JSON.stringify(patch),
+      },
+    );
+    const saved = result.account;
+    if (!saved || saved.accountId !== connection.accountId) {
+      throw new Error("The integration policy response was invalid");
+    }
+    if (!keychainOperations.isCurrentEpoch(operation.epoch)) return;
+    keychainOperations.invalidateLoads();
+    managedIntegrations = managedIntegrations.map((current) =>
+      current.accountId === saved.accountId ? saved : current,
+    );
     connectorNotice = `${connection.appName} access updated.`;
   } catch (error) {
+    if (!keychainOperations.isCurrentEpoch(operation.epoch)) return;
     connectorNotice = errMessage(error, `Could not update ${connection.appName}.`);
-  } finally {
-    keychainOperations.finishMutation(operation);
     await renderConnectors();
+  } finally {
+    if (keychainOperations.finishMutation(operation)) drawConnectors(false);
   }
 }
 
