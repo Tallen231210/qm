@@ -309,6 +309,7 @@ export interface PendingApproval {
   reason?: string;
   purpose?: string;
   summary?: string;
+  summaryDetail?: string;
   matched?: string;
   grantModes?: { session: boolean; always: boolean };
   blocksInput?: boolean;
@@ -645,19 +646,13 @@ export function makeRunResumeStreamFn(
   return fn as unknown as StreamFn;
 }
 
-export async function runApprovalTurn(
-  threadRef: string,
-  agent: Agent,
-  decision: ApprovalDecision,
-  getTurnOptions: (() => TurnOptions) | undefined,
-  onWork: WorkObserver | undefined,
-  signal?: AbortSignal,
-  slot?: RunSlot,
-): Promise<void> {
-  const stream = createAssistantMessageEventStream();
-  await drive(stream, agent.state.model, threadRef, agent, getTurnOptions, signal, onWork, decision, false, slot);
-  const outcome = await stream.result();
-  if (outcome.stopReason === "error") throw new Error(outcome.errorMessage || "Could not send the approval.");
+export async function resolveApproval(decision: ApprovalDecision): Promise<string> {
+  const submit = await api<{ runId?: string }>(`/api/approvals/${encodeURIComponent(decision.requestId)}`, {
+    method: "POST",
+    body: JSON.stringify({ approved: decision.approved, ...(decision.scope ? { scope: decision.scope } : {}) }),
+  });
+  if (!submit.runId) throw new Error("Could not continue after the approval.");
+  return submit.runId;
 }
 
 export function makeOpenerStreamFn(
